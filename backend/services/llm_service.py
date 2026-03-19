@@ -5,6 +5,7 @@ Handles message normalization, fallback logic, and context-aware query generatio
 
 import os
 import logging
+import re
 from typing import Optional, List, Dict, Tuple
 import google.generativeai as genai
 import aiohttp
@@ -89,22 +90,24 @@ Brief explanation of what the query does
 
         messages.append({"role": "user", "content": user_input})
 
-        # Try preferred model first
+        # Try preferred model first, but skip Perplexity if it is unavailable or expired.
         model_used = preferred_model
         result = await self._call_llm(preferred_model, messages)
 
-        if result is None or result.strip() == "":
-            # Fallback to other model
-            fallback_model = "perplexity" if preferred_model == "gemini" else "gemini"
+        if (result is None or result.strip() == "") and preferred_model != "gemini":
             logger.warning(
-                f"Preferred model {preferred_model} failed, attempting fallback {fallback_model}"
+                f"Preferred model {preferred_model} failed, attempting fallback gemini"
             )
-            model_used = fallback_model
-            result = await self._call_llm(fallback_model, messages)
+            model_used = "gemini"
+            result = await self._call_llm("gemini", messages)
 
         if result is None or result.strip() == "":
-            logger.error("Both LLM models failed to generate response")
-            return None, None, model_used
+            logger.warning("LLM generation unavailable, using heuristic SQL fallback")
+            sql_query, explanation = self._generate_query_heuristically(
+                user_input=user_input,
+                database_schema=database_schema,
+            )
+            return sql_query, explanation, "heuristic"
 
         # Parse response
         sql_query = self._extract_sql(result)
@@ -150,21 +153,21 @@ After the list, provide a brief explanation of how these KPIs work together."""
             },
         ]
 
-        # Try preferred model first
+        # Try preferred model first, but skip Perplexity if it is unavailable or expired.
         model_used = preferred_model
         result = await self._call_llm(preferred_model, messages)
 
-        if result is None or result.strip() == "":
-            fallback_model = "perplexity" if preferred_model == "gemini" else "gemini"
+        if (result is None or result.strip() == "") and preferred_model != "gemini":
             logger.warning(
-                f"Preferred model {preferred_model} failed, attempting fallback {fallback_model}"
+                f"Preferred model {preferred_model} failed, attempting fallback gemini"
             )
-            model_used = fallback_model
-            result = await self._call_llm(fallback_model, messages)
+            model_used = "gemini"
+            result = await self._call_llm("gemini", messages)
 
         if result is None or result.strip() == "":
-            logger.error("Both LLM models failed to generate KPI suggestions")
-            return None, None, model_used
+            logger.warning("LLM KPI generation unavailable, using heuristic KPI fallback")
+            kpis, explanation = self._generate_kpis_heuristically(database_schema)
+            return kpis, explanation, "heuristic"
 
         # Parse KPIs and explanation
         kpis = self._parse_kpi_suggestions(result)
@@ -210,29 +213,14 @@ After the list, provide a brief explanation of how these KPIs work together."""
             return None
 
         try:
-            # Convert messages to Gemini format
-            chat_history = []
-            system_instruction = None
-
+            prompt_parts = []
             for msg in messages:
-                if msg["role"] == "system":
-                    system_instruction = msg["content"]
-                else:
-                    chat_history.append(
-                        {
-                            "role": "model" if msg["role"] == "assistant" else "user",
-                            "parts": [msg["content"]],
-                        }
-                    )
+                role = msg.get("role", "user").upper()
+                prompt_parts.append(f"{role}:\n{msg.get('content', '')}")
 
-            # Use generative model
-            model = genai.GenerativeModel(
-                self.gemini_model,
-                system_instruction=system_instruction,
-            )
-
+            model = genai.GenerativeModel(self.gemini_model)
             response = model.generate_content(
-                chat_history[-1]["parts"][0] if chat_history else "",
+                "\n\n".join(prompt_parts),
                 stream=False,
             )
 
@@ -302,6 +290,212 @@ After the list, provide a brief explanation of how these KPIs work together."""
             return None
 
         return None
+
+    @staticmethod
+    def _parse_schema(database_schema: str) -> List[Dict[str, object]]:
+        """Parse compact schema into table metadata."""
+        tables: List[Dict[str, object]] = []
+        for raw_line in database_schema.splitlines():
+            line = raw_line.strip()
+            if not line or ":" not in line or "." not in line:
+                continue
+
+            table_ref, columns_raw = line.split(":", 1)
+            schema_name, table_name = table_ref.strip().split(".", 1)
+            columns = [col.strip() for col in columns_raw.split(",") if col.strip()]
+            tables.append(
+                {
+                    "schema": schema_name,
+                    "table": table_name,
+                    "full_name": f"{schema_name}.{table_name}",
+                    "columns": columns,
+                }
+            )
+        return tables
+
+    @staticmethod
+    def _find_table_candidates(
+        user_input: str, tables: List[Dict[str, object]]
+    ) -> List[Dict[str, object]]:
+        """Find tables referenced in the user input."""
+        normalized_input = re.sub(r"[^a-z0-9_ ]+", " ", user_input.lower())
+        candidates = []
+
+        for table in tables:
+            table_name = str(table["table"]).lower()
+            singular_name = table_name[:-1] if table_name.endswith("s") else table_name
+            patterns = [
+                rf"\b{re.escape(table_name)}\b",
+                rf"\b{re.escape(singular_name)}\b",
+            ]
+            if any(re.search(pattern, normalized_input) for pattern in patterns):
+                candidates.append(table)
+
+        return candidates
+
+    @staticmethod
+    def _find_column(
+        columns: List[str], keywords: List[str], preferred_suffixes: Optional[List[str]] = None
+    ) -> Optional[str]:
+        """Find a column matching any keyword and optional suffix preference."""
+        preferred_suffixes = preferred_suffixes or []
+        lowered = [(column, column.lower()) for column in columns]
+
+        for keyword in keywords:
+            for column, lower_column in lowered:
+                if keyword in lower_column:
+                    if not preferred_suffixes or any(
+                        lower_column.endswith(suffix) for suffix in preferred_suffixes
+                    ):
+                        return column
+
+        for keyword in keywords:
+            for column, lower_column in lowered:
+                if keyword in lower_column:
+                    return column
+
+        return None
+
+    def _generate_query_heuristically(
+        self,
+        user_input: str,
+        database_schema: str,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Generate a conservative SQL query for common analytics prompts."""
+        tables = self._parse_schema(database_schema)
+        normalized_input = re.sub(r"\s+", " ", user_input.strip().lower())
+
+        if not tables:
+            return None, "No usable schema information was available."
+
+        if re.search(r"\bhow many tables\b|\bnumber of tables\b|\bcount tables\b", normalized_input):
+            return (
+                "SELECT COUNT(*) AS table_count "
+                "FROM information_schema.tables "
+                "WHERE table_schema NOT IN ('pg_catalog', 'information_schema');",
+                "Counts all non-system tables available in the database.",
+            )
+
+        candidates = self._find_table_candidates(normalized_input, tables)
+        table = candidates[0] if candidates else tables[0]
+        full_name = str(table["full_name"])
+        columns = list(table["columns"])
+
+        count_alias = f"{table['table']}_count"
+        if re.search(r"\bhow many\b|\bcount\b|\bnumber of\b", normalized_input):
+            return (
+                f"SELECT COUNT(*) AS {count_alias} FROM {full_name};",
+                f"Counts the total number of rows in {full_name}.",
+            )
+
+        limit_match = re.search(r"\btop\s+(\d+)\b|\blimit\s+(\d+)\b|\bfirst\s+(\d+)\b", normalized_input)
+        limit = next((int(group) for group in limit_match.groups() if group), 10) if limit_match else 10
+
+        sort_column = None
+        sort_keywords = [
+            "price",
+            "amount",
+            "total",
+            "count",
+            "date",
+            "created",
+            "travel",
+            "start",
+            "end",
+        ]
+        if re.search(r"\btop\b|\bhighest\b|\blargest\b|\bbiggest\b|\bmost\b", normalized_input):
+            sort_column = self._find_column(columns, sort_keywords)
+            if sort_column:
+                return (
+                    f"SELECT * FROM {full_name} ORDER BY {sort_column} DESC LIMIT {limit};",
+                    f"Returns the top {limit} rows from {full_name} ordered by {sort_column} descending.",
+                )
+
+        if re.search(r"\blatest\b|\brecent\b|\bnewest\b", normalized_input):
+            sort_column = self._find_column(columns, ["date", "created", "paid", "start", "end"])
+            if sort_column:
+                return (
+                    f"SELECT * FROM {full_name} ORDER BY {sort_column} DESC LIMIT {limit};",
+                    f"Returns the most recent {limit} rows from {full_name} based on {sort_column}.",
+                )
+
+        if re.search(r"\bshow\b|\blist\b|\bget\b|\bdisplay\b", normalized_input):
+            return (
+                f"SELECT * FROM {full_name} LIMIT {limit};",
+                f"Returns up to {limit} rows from {full_name}.",
+            )
+
+        return (
+            f"SELECT * FROM {full_name} LIMIT {limit};",
+            f"Generated a safe default query for {full_name} because the LLM provider was unavailable.",
+        )
+
+    def _generate_kpis_heuristically(
+        self,
+        database_schema: str,
+    ) -> Tuple[List[Dict], str]:
+        """Generate schema-aware KPI suggestions without an LLM."""
+        tables = self._parse_schema(database_schema)
+        full_names = {str(table["table"]): str(table["full_name"]) for table in tables}
+
+        kpis: List[Dict] = []
+
+        if "bookings" in full_names:
+            kpis.append(
+                {
+                    "number": len(kpis) + 1,
+                    "name": "Total Bookings",
+                    "description": f"Track booking volume over time from {full_names['bookings']} to monitor sales activity.",
+                }
+            )
+        if "payments" in full_names:
+            kpis.append(
+                {
+                    "number": len(kpis) + 1,
+                    "name": "Payment Collection Value",
+                    "description": f"Sum payment amounts in {full_names['payments']} to measure realized revenue.",
+                }
+            )
+        if "trips" in full_names and "bookings" in full_names:
+            kpis.append(
+                {
+                    "number": len(kpis) + 1,
+                    "name": "Trip Utilization",
+                    "description": f"Compare booking counts in {full_names['bookings']} against trip capacity in {full_names['trips']} to identify underbooked or full trips.",
+                }
+            )
+        if "customers" in full_names:
+            kpis.append(
+                {
+                    "number": len(kpis) + 1,
+                    "name": "New Customer Acquisition",
+                    "description": f"Measure how many customers are added over time using {full_names['customers']}.",
+                }
+            )
+        if "destinations" in full_names and "trips" in full_names:
+            kpis.append(
+                {
+                    "number": len(kpis) + 1,
+                    "name": "Destination Performance",
+                    "description": f"Join {full_names['trips']} with {full_names['destinations']} to see which destinations drive the most offerings and bookings.",
+                }
+            )
+
+        while len(kpis) < 4:
+            table = tables[len(kpis) % len(tables)]
+            kpis.append(
+                {
+                    "number": len(kpis) + 1,
+                    "name": f"{table['table'].replace('_', ' ').title()} Activity",
+                    "description": f"Track row growth and recent activity in {table['full_name']} to monitor operational changes.",
+                }
+            )
+
+        explanation = (
+            "These KPI suggestions are derived directly from the available schema, "
+            "so the endpoint remains useful even when external LLM providers are unavailable."
+        )
+        return kpis[:4], explanation
 
     @staticmethod
     def _normalize_for_perplexity(messages: List[Dict]) -> List[Dict]:

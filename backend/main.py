@@ -10,6 +10,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic_settings import BaseSettings
 
 from services.database_service import DatabaseService
@@ -501,20 +502,26 @@ async def delete_session(session_id: str):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     """Custom HTTP exception handler."""
-    return {
-        "error": exc.detail or "Internal server error",
-        "status_code": exc.status_code,
-    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.detail or "Internal server error",
+            "status_code": exc.status_code,
+        },
+    )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
     """General exception handler."""
     logger.error(f"Unhandled exception: {exc}")
-    return {
-        "error": "Internal server error",
-        "status_code": status.HTTP_500_INTERNAL_SERVER_ERROR,
-    }
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal server error",
+            "status_code": status.HTTP_500_INTERNAL_SERVER_ERROR,
+        },
+    )
 
 
 if __name__ == "__main__":
