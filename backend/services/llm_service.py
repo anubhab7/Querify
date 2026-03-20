@@ -38,7 +38,7 @@ class LLMService:
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
 
-        self.gemini_model = "gemini-2.0-flash"
+        self.gemini_model = "gemini-2.5-flash"
         self.perplexity_model = "sonar-pro"
         self.perplexity_endpoint = "https://api.perplexity.ai/chat/completions"
 

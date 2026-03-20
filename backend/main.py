@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic_settings import BaseSettings
 
-from services.database_service import DatabaseService
+from services.database_service import DatabaseService, DatabaseConnectionError
 from services.llm_service import LLMService
 from services.chat_session import ChatSessionManager, MessageRole
 from models.schema import (
@@ -24,6 +24,8 @@ from models.schema import (
     KPISuggestion,
     TestConnectionRequest,
     TestConnectionResponse,
+    DatabaseConnectRequest,
+    DatabaseConnectResponse,
     SchemaRequest,
     SchemaResponse,
     ChatSessionRequest,
@@ -140,6 +142,18 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_exception_handler(request, exc: DatabaseConnectionError):
+    """Return structured connection errors for database auth/connectivity issues."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.code,
+            "detail": exc.message,
+        },
+    )
+
+
 # ============================================================================
 # Health & Connection Check Endpoints
 # ============================================================================
@@ -193,6 +207,50 @@ async def test_connection(request: TestConnectionRequest = TestConnectionRequest
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Connection test error: {str(e)}",
+        )
+
+
+@app.post(
+    "/database/connect",
+    response_model=DatabaseConnectResponse,
+    tags=["Database"],
+)
+async def connect_to_user_database(request: DatabaseConnectRequest):
+    """
+    Test a user-supplied PostgreSQL connection without replacing the app's main database.
+
+    Returns:
+        Connection status and the database target that was tested
+    """
+    try:
+        await DatabaseService.test_credentials(
+            host=request.host.strip(),
+            port=request.port,
+            database=request.database.strip(),
+            username=request.username.strip(),
+            password=request.password.get_secret_value(),
+            ssl=request.ssl,
+        )
+
+        return DatabaseConnectResponse(
+            success=True,
+            message="Database connection successful",
+            database=request.database.strip(),
+            host=request.host.strip(),
+            port=request.port,
+            ssl=request.ssl,
+        )
+
+    except DatabaseConnectionError:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected database connection error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "CONNECTION_FAILED",
+                "detail": f"Unexpected database connection error: {str(e)}",
+            },
         )
 
 

@@ -8,8 +8,23 @@ import re
 from typing import List, Dict, Optional, Tuple
 from sqlparse import parse, sql
 import logging
+import socket
+import ssl as ssl_lib
+from urllib.parse import quote
+
+from asyncpg import exceptions as asyncpg_exceptions
 
 logger = logging.getLogger(__name__)
+
+
+class DatabaseConnectionError(Exception):
+    """Structured database connection error."""
+
+    def __init__(self, code: str, message: str, status_code: int = 500):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
 
 
 class DatabaseService:
@@ -28,11 +43,22 @@ class DatabaseService:
     async def connect(self) -> None:
         """Create connection pool to PostgreSQL."""
         try:
-            self.pool = await asyncpg.create_pool(self.connection_string)
+            self.pool = await asyncpg.create_pool(
+                dsn=self.connection_string,
+                min_size=1,
+                max_size=5,
+                timeout=10,
+                command_timeout=10,
+            )
             logger.info("Database connection pool created successfully")
         except Exception as e:
-            logger.error(f"Failed to create database connection pool: {e}")
-            raise
+            classified_error = self._classify_connection_error(e)
+            logger.error(
+                "Failed to create database connection pool [%s]: %s",
+                classified_error.code,
+                classified_error.message,
+            )
+            raise classified_error from e
 
     async def disconnect(self) -> None:
         """Close connection pool."""
@@ -57,6 +83,70 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"Database connection test failed: {e}")
             return False
+
+    @classmethod
+    def build_connection_string(
+        cls,
+        *,
+        host: str,
+        port: int,
+        database: str,
+        username: str,
+        password: str,
+    ) -> str:
+        """Build a PostgreSQL connection string from discrete credentials."""
+        quoted_username = quote(username, safe="")
+        quoted_password = quote(password, safe="")
+        quoted_host = host.strip()
+        quoted_database = quote(database, safe="")
+        return (
+            f"postgresql://{quoted_username}:{quoted_password}"
+            f"@{quoted_host}:{port}/{quoted_database}"
+        )
+
+    @classmethod
+    async def test_credentials(
+        cls,
+        *,
+        host: str,
+        port: int,
+        database: str,
+        username: str,
+        password: str,
+        ssl: Optional[bool] = None,
+        ) -> None:
+        """
+        Validate a set of PostgreSQL credentials using a short-lived pool.
+
+        Raises:
+            DatabaseConnectionError: If the connection attempt fails
+        """
+        connection_string = cls.build_connection_string(
+            host=host,
+            port=port,
+            database=database,
+            username=username,
+            password=password,
+        )
+
+        pool: Optional[asyncpg.Pool] = None
+        try:
+            ssl_config = cls._build_ssl_config(ssl)
+            pool = await asyncpg.create_pool(
+                dsn=connection_string,
+                min_size=1,
+                max_size=1,
+                timeout=10,
+                command_timeout=10,
+                ssl=ssl_config,
+            )
+            async with pool.acquire() as connection:
+                await connection.fetchval("SELECT 1")
+        except Exception as e:
+            raise cls._classify_connection_error(e) from e
+        finally:
+            if pool:
+                await pool.close()
 
     async def get_compact_database_schema(self) -> str:
         """
@@ -267,3 +357,117 @@ class DatabaseService:
         # PostgreSQL identifiers: alphanumeric, underscore, can start with letter or underscore
         pattern = r"^[a-zA-Z_][a-zA-Z0-9_]*$"
         return bool(re.match(pattern, identifier))
+
+    @staticmethod
+    def _classify_connection_error(error: Exception) -> DatabaseConnectionError:
+        """Map common asyncpg and network errors to stable API error codes."""
+        message = str(error).strip() or error.__class__.__name__
+        lowered = message.lower()
+
+        if isinstance(error, asyncpg_exceptions.InvalidPasswordError):
+            return DatabaseConnectionError(
+                code="INVALID_CREDENTIALS",
+                message="Authentication failed. Check the username and password.",
+                status_code=401,
+            )
+
+        if isinstance(error, asyncpg_exceptions.InvalidCatalogNameError):
+            return DatabaseConnectionError(
+                code="DATABASE_NOT_FOUND",
+                message="The specified database does not exist or is not accessible.",
+                status_code=404,
+            )
+
+        if isinstance(error, asyncpg_exceptions.InsufficientPrivilegeError):
+            return DatabaseConnectionError(
+                code="INSUFFICIENT_PRIVILEGES",
+                message="The database user does not have permission to access this database.",
+                status_code=403,
+            )
+
+        if isinstance(error, asyncpg_exceptions.TooManyConnectionsError):
+            return DatabaseConnectionError(
+                code="TOO_MANY_CONNECTIONS",
+                message="The database server has reached its connection limit. Try again shortly.",
+                status_code=503,
+            )
+
+        if isinstance(error, (TimeoutError, socket.timeout)):
+            return DatabaseConnectionError(
+                code="CONNECTION_TIMEOUT",
+                message="Timed out while trying to connect to the database server.",
+                status_code=504,
+            )
+
+        if isinstance(error, socket.gaierror):
+            return DatabaseConnectionError(
+                code="HOST_RESOLUTION_FAILED",
+                message="The database host could not be resolved. Check the hostname.",
+                status_code=503,
+            )
+
+        if "no pg_hba.conf entry" in lowered and "no encryption" in lowered:
+            return DatabaseConnectionError(
+                code="SSL_REQUIRED",
+                message="This database server requires SSL. Retry the connection with ssl=true.",
+                status_code=400,
+            )
+
+        if "password authentication failed" in lowered:
+            return DatabaseConnectionError(
+                code="INVALID_CREDENTIALS",
+                message="Authentication failed. Check the username and password.",
+                status_code=401,
+            )
+
+        if isinstance(error, (ConnectionRefusedError, OSError)):
+            if "ssl" in lowered:
+                return DatabaseConnectionError(
+                    code="SSL_ERROR",
+                    message="The database rejected the SSL configuration for this connection.",
+                    status_code=502,
+                )
+            if "timeout" in lowered or "timed out" in lowered:
+                return DatabaseConnectionError(
+                    code="CONNECTION_TIMEOUT",
+                    message="Timed out while trying to connect to the database server.",
+                    status_code=504,
+                )
+            if "refused" in lowered or "connect call failed" in lowered:
+                return DatabaseConnectionError(
+                    code="CONNECTION_REFUSED",
+                    message="The database server refused the connection. Check the host and port.",
+                    status_code=503,
+                )
+            if "name or service not known" in lowered or "nodename nor servname provided" in lowered:
+                return DatabaseConnectionError(
+                    code="HOST_RESOLUTION_FAILED",
+                    message="The database host could not be resolved. Check the hostname.",
+                    status_code=503,
+                )
+
+        return DatabaseConnectionError(
+            code="CONNECTION_FAILED",
+            message=f"Failed to connect to the database: {message}",
+            status_code=500,
+        )
+
+    @staticmethod
+    def _build_ssl_config(ssl_enabled: Optional[bool]):
+        """
+        Convert the API's boolean SSL flag into asyncpg SSL settings.
+
+        `ssl=True` means "require an encrypted connection".
+        `ssl=False` disables SSL.
+        `ssl=None` lets the driver choose its default behavior.
+        """
+        if ssl_enabled is None:
+            return None
+
+        if ssl_enabled is False:
+            return False
+
+        ssl_context = ssl_lib.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl_lib.CERT_NONE
+        return ssl_context

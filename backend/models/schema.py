@@ -2,7 +2,7 @@
 Pydantic models for API requests and responses.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
@@ -70,6 +70,29 @@ class TestConnectionResponse(BaseModel):
     success: bool = Field(..., description="Whether connection test succeeded")
     message: str = Field(..., description="Status message")
     database: Optional[str] = Field(None, description="Database being connected to")
+
+
+class DatabaseConnectRequest(BaseModel):
+    """Request model for testing user-supplied PostgreSQL credentials."""
+    host: str = Field(..., min_length=1, description="PostgreSQL host")
+    port: int = Field(5432, ge=1, le=65535, description="PostgreSQL port")
+    database: str = Field(..., min_length=1, description="Database name")
+    username: str = Field(..., min_length=1, description="Database username")
+    password: SecretStr = Field(..., description="Database password")
+    ssl: Optional[bool] = Field(
+        None,
+        description="Set true to require SSL, false to disable it, or omit to use driver defaults",
+    )
+
+
+class DatabaseConnectResponse(BaseModel):
+    """Response model for user-supplied PostgreSQL connection tests."""
+    success: bool = Field(..., description="Whether connection test succeeded")
+    message: str = Field(..., description="Connection status message")
+    database: str = Field(..., description="Database that was tested")
+    host: str = Field(..., description="Database host that was tested")
+    port: int = Field(..., description="Database port that was tested")
+    ssl: Optional[bool] = Field(None, description="SSL mode used during the connection test")
 
 
 class SchemaRequest(BaseModel):

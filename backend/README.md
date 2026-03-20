@@ -47,6 +47,7 @@ backend/
 #### Health & Connection
 - `GET /health` - Health check
 - `POST /test-connection` - Test database connection
+- `POST /database/connect` - Test a user-supplied PostgreSQL connection without changing the app's default database
 
 #### Database Schema
 - `GET /schema` - Get compact database schema
@@ -105,6 +106,20 @@ The API will be available at `http://localhost:8000`
 ### Test Connection
 ```bash
 curl -X POST http://localhost:8000/test-connection
+```
+
+### Test Custom PostgreSQL Credentials
+```bash
+curl -X POST http://localhost:8000/database/connect \
+  -H "Content-Type: application/json" \
+  -d '{
+    "host": "your-db-host",
+    "port": 5432,
+    "database": "your_database",
+    "username": "your_user",
+    "password": "your_password",
+    "ssl": true
+  }'
 ```
 
 ### Get Schema
@@ -190,6 +205,17 @@ All endpoints return structured error responses:
   "status_code": 400
 }
 ```
+
+Common `/database/connect` error codes:
+- `INVALID_CREDENTIALS` - Username or password is incorrect
+- `DATABASE_NOT_FOUND` - The target database does not exist
+- `INSUFFICIENT_PRIVILEGES` - The user cannot access the requested database
+- `HOST_RESOLUTION_FAILED` - The hostname could not be resolved
+- `CONNECTION_REFUSED` - The server refused the connection
+- `CONNECTION_TIMEOUT` - The server did not respond in time
+- `SSL_REQUIRED` - The server requires SSL, so retry with `"ssl": true`
+- `SSL_ERROR` - The submitted SSL settings were rejected by the server
+- `TOO_MANY_CONNECTIONS` - The PostgreSQL server has reached its client limit
 
 ## Performance Considerations
 
