@@ -1,304 +1,293 @@
 """
-Chat Session Management.
-Handles conversation history, context, and pronoun resolution.
+Persistent chat session management backed by the app database.
+Handles chat storage, message history, and pronoun resolution.
 """
 
+import logging
 import re
 import uuid
-from typing import Optional, List
-from datetime import datetime
+from typing import Dict, List, Optional
+
 from models.schema import ChatMessage, MessageRole
-import logging
+from services.database_service import DatabaseService
 
 logger = logging.getLogger(__name__)
 
 
-class ChatSession:
-    """Manages chat sessions with history and context."""
+class ChatSessionManager:
+    """Manages persistent chat sessions stored in PostgreSQL."""
 
-    def __init__(self, session_id: Optional[str] = None, max_history: int = 8):
-        """
-        Initialize a chat session.
-
-        Args:
-            session_id: Optional session ID (generates new one if not provided)
-            max_history: Maximum number of messages to keep in history
-        """
-        self.session_id = session_id or str(uuid.uuid4())
-        self.messages: List[ChatMessage] = []
+    def __init__(self, app_db: DatabaseService, max_history: int = 8):
+        self.app_db = app_db
         self.max_history = max_history
-        self.last_referenced_table: Optional[str] = None
-        self.created_at = datetime.now()
-        self.last_activity = datetime.now()
 
-    def add_message(self, role: MessageRole, content: str) -> None:
-        """
-        Add a message to the session history.
+    async def create_chat(
+        self,
+        *,
+        user_id: str,
+        title: str,
+        host: str,
+        port: int,
+        database: str,
+        username: str,
+        password: str,
+        ssl: Optional[bool],
+    ) -> Dict:
+        """Create a new persistent chat with target DB credentials."""
+        chat_id = str(uuid.uuid4())
+        row = await self.app_db.fetchrow(
+            """
+            INSERT INTO chats (
+                id, user_id, title, db_host, db_port, db_name, db_username, db_password, db_ssl
+            )
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8, $9)
+            RETURNING id, title, created_at, updated_at, last_referenced_table;
+            """,
+            chat_id,
+            user_id,
+            title,
+            host.strip(),
+            port,
+            database.strip(),
+            username.strip(),
+            password,
+            ssl,
+        )
+        assert row is not None
+        logger.info("Created chat %s for user %s", chat_id, user_id)
+        return dict(row)
 
-        Args:
-            role: Message role (user, assistant, system)
-            content: Message content
-        """
-        self.messages.append(ChatMessage(role=role, content=content))
-        self.last_activity = datetime.now()
+    async def get_chat(self, chat_id: str, user_id: str) -> Optional[Dict]:
+        """Fetch a chat and its target DB credentials for a user."""
+        row = await self.app_db.fetchrow(
+            """
+            SELECT
+                id,
+                user_id,
+                title,
+                db_host,
+                db_port,
+                db_name,
+                db_username,
+                db_password,
+                db_ssl,
+                last_referenced_table,
+                created_at,
+                updated_at
+            FROM chats
+            WHERE id = $1::uuid AND user_id = $2::uuid;
+            """,
+            chat_id,
+            user_id,
+        )
+        return dict(row) if row else None
 
-        # Trim history if exceeds max
-        if len(self.messages) > self.max_history:
-            self.messages = self.messages[-self.max_history :]
+    async def list_chats(self, user_id: str) -> List[Dict]:
+        """List chat summaries for a user."""
+        rows = await self.app_db.fetch(
+            """
+            SELECT
+                id,
+                title,
+                created_at,
+                COALESCE(updated_at, last_activity, created_at) AS updated_at,
+                last_referenced_table
+            FROM chats
+            WHERE user_id = $1::uuid
+            ORDER BY updated_at DESC, created_at DESC;
+            """,
+            user_id,
+        )
+        return [dict(row) for row in rows]
 
-    def get_history(self, include_system: bool = False) -> List[ChatMessage]:
-        """
-        Get message history.
+    async def get_chat_history(self, chat_id: str, user_id: str) -> List[Dict]:
+        """Fetch persisted history for a chat."""
+        rows = await self.app_db.fetch(
+            """
+            SELECT
+                m.id,
+                m.chat_id,
+                m.user_input,
+                m.sql_query,
+                m.explanation,
+                COALESCE(m.created_at, m.timestamp) AS created_at
+            FROM messages m
+            INNER JOIN chats c ON c.id = m.chat_id
+            WHERE m.chat_id = $1::uuid AND c.user_id = $2::uuid
+            ORDER BY COALESCE(m.created_at, m.timestamp) ASC;
+            """,
+            chat_id,
+            user_id,
+        )
+        return [dict(row) for row in rows]
 
-        Args:
-            include_system: Whether to include system messages
+    async def get_recent_messages_for_llm(
+        self, chat_id: str, user_id: str
+    ) -> List[ChatMessage]:
+        """Transform recent persisted query turns into chat messages for the LLM."""
+        rows = await self.app_db.fetch(
+            """
+            SELECT
+                m.user_input,
+                m.explanation,
+                COALESCE(m.created_at, m.timestamp) AS created_at
+            FROM messages m
+            INNER JOIN chats c ON c.id = m.chat_id
+            WHERE m.chat_id = $1::uuid AND c.user_id = $2::uuid
+            ORDER BY COALESCE(m.created_at, m.timestamp) DESC
+            LIMIT $3;
+            """,
+            chat_id,
+            user_id,
+            self.max_history,
+        )
 
-        Returns:
-            List of messages
-        """
-        if include_system:
-            return self.messages
-        return [m for m in self.messages if m.role != MessageRole.SYSTEM]
+        messages: List[ChatMessage] = []
+        for row in reversed(rows):
+            messages.append(ChatMessage(role=MessageRole.USER, content=row["user_input"]))
+            messages.append(
+                ChatMessage(role=MessageRole.ASSISTANT, content=row["explanation"])
+            )
+        return messages
 
-    def update_last_referenced_table(self, sql_query: str) -> None:
-        """
-        Extract and update the last referenced table from a SQL query.
+    async def append_query_message(
+        self,
+        *,
+        chat_id: str,
+        user_input: str,
+        sql_query: str,
+        explanation: str,
+    ) -> Dict:
+        """Persist a query interaction for a chat."""
+        message_id = str(uuid.uuid4())
+        row = await self.app_db.fetchrow(
+            """
+            INSERT INTO messages (
+                id, chat_id, role, content, user_input, sql_query, explanation, timestamp, created_at
+            )
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, NOW(), NOW())
+            RETURNING id, chat_id, user_input, sql_query, explanation, created_at;
+            """,
+            message_id,
+            chat_id,
+            MessageRole.USER.value,
+            user_input,
+            user_input,
+            sql_query,
+            explanation,
+        )
+        await self.touch_chat(chat_id)
+        assert row is not None
+        return dict(row)
 
-        Uses regex to identify table names from FROM and JOIN clauses.
+    async def touch_chat(self, chat_id: str) -> None:
+        """Refresh the chat update timestamp."""
+        await self.app_db.execute(
+            """
+            UPDATE chats
+            SET updated_at = NOW()
+            WHERE id = $1::uuid;
+            """,
+            chat_id,
+        )
 
-        Args:
-            sql_query: SQL query to analyze
-        """
+    async def update_last_referenced_table(self, chat_id: str, sql_query: str) -> None:
+        """Persist the last table referenced by the generated SQL query."""
         table_name = self._extract_table_from_query(sql_query)
-        if table_name:
-            self.last_referenced_table = table_name
-            logger.debug(f"Updated last referenced table: {table_name}")
+        await self.app_db.execute(
+            """
+            UPDATE chats
+            SET last_referenced_table = $2, updated_at = NOW()
+            WHERE id = $1::uuid;
+            """,
+            chat_id,
+            table_name,
+        )
 
-    def resolve_pronouns(self, user_input: str) -> str:
-        """
-        Replace pronouns like "it" or "that table" with the last referenced table.
+    async def resolve_pronouns(self, chat_id: str, user_input: str) -> str:
+        """Resolve lightweight table pronouns using the stored chat context."""
+        last_table = await self.app_db.fetchval(
+            """
+            SELECT last_referenced_table
+            FROM chats
+            WHERE id = $1::uuid;
+            """,
+            chat_id,
+        )
 
-        Args:
-            user_input: User input text
-
-        Returns:
-            Resolved text with pronouns replaced
-        """
-        if not self.last_referenced_table:
+        if not last_table:
             return user_input
 
-        resolved = user_input
-
-        # Pattern 1: "it" or "It" as standalone word (not part of other words)
         resolved = re.sub(
             r"\bit\b",
-            self.last_referenced_table,
-            resolved,
+            last_table,
+            user_input,
             flags=re.IGNORECASE,
             count=1,
         )
-
-        # Pattern 2: "that table" or "That Table"
         resolved = re.sub(
             r"\bthat\s+table\b",
-            self.last_referenced_table,
+            last_table,
             resolved,
             flags=re.IGNORECASE,
             count=1,
         )
-
-        # Pattern 3: "the table" when preceded by context
-        if "the table" in resolved.lower() and len(resolved) < 200:
-            resolved = re.sub(
-                r"\bthe\s+table\b",
-                self.last_referenced_table,
-                resolved,
-                flags=re.IGNORECASE,
-                count=1,
-            )
-
-        # Pattern 4: "this table"
+        resolved = re.sub(
+            r"\bthe\s+table\b",
+            last_table,
+            resolved,
+            flags=re.IGNORECASE,
+            count=1,
+        )
         resolved = re.sub(
             r"\bthis\s+table\b",
-            self.last_referenced_table,
+            last_table,
             resolved,
             flags=re.IGNORECASE,
             count=1,
         )
-
-        if resolved != user_input:
-            logger.debug(
-                f"Resolved pronouns: '{user_input}' -> '{resolved}'"
-            )
-
         return resolved
 
-    def clear(self) -> None:
-        """Clear chat history."""
-        self.messages = []
-        self.last_referenced_table = None
-        logger.debug(f"Cleared session {self.session_id}")
-
-    def to_dict(self) -> dict:
-        """
-        Convert session to dictionary.
-
-        Returns:
-            Session data as dict
-        """
-        return {
-            "session_id": self.session_id,
-            "messages": [
-                {"role": m.role.value, "content": m.content}
-                for m in self.messages
-            ],
-            "last_referenced_table": self.last_referenced_table,
-            "created_at": self.created_at.isoformat(),
-            "last_activity": self.last_activity.isoformat(),
-        }
+    async def delete_chat(self, chat_id: str, user_id: str) -> bool:
+        """Delete a chat that belongs to the given user."""
+        result = await self.app_db.execute(
+            """
+            DELETE FROM chats
+            WHERE id = $1::uuid AND user_id = $2::uuid;
+            """,
+            chat_id,
+            user_id,
+        )
+        return result.endswith("1")
 
     @staticmethod
     def _extract_table_from_query(sql_query: str) -> Optional[str]:
-        """
-        Extract the primary table name from a SQL query.
-
-        Looks for FROM and JOIN clauses.
-
-        Args:
-            sql_query: SQL query string
-
-        Returns:
-            Table name or None
-        """
+        """Extract the primary table name from a SQL query."""
         if not sql_query:
             return None
 
         try:
-            # Pattern for FROM clause: FROM schema.table
             from_match = re.search(
                 r"\bFROM\s+(?:(\w+)\.)?(\w+)",
                 sql_query,
-                re.IGNORECASE
+                re.IGNORECASE,
             )
-
             if from_match:
                 schema = from_match.group(1)
                 table = from_match.group(2)
                 return f"{schema}.{table}" if schema else table
 
-            # Pattern for JOIN clause if no FROM found
             join_match = re.search(
                 r"\bJOIN\s+(?:(\w+)\.)?(\w+)",
                 sql_query,
-                re.IGNORECASE
+                re.IGNORECASE,
             )
-
             if join_match:
                 schema = join_match.group(1)
                 table = join_match.group(2)
                 return f"{schema}.{table}" if schema else table
 
             return None
-
         except Exception as e:
-            logger.error(f"Error extracting table from query: {e}")
+            logger.error("Error extracting table from query: %s", e)
             return None
-
-
-class ChatSessionManager:
-    """Manages multiple chat sessions."""
-
-    def __init__(self, session_timeout_minutes: int = 60):
-        """
-        Initialize session manager.
-
-        Args:
-            session_timeout_minutes: Minutes before a session expires
-        """
-        self.sessions: dict = {}
-        self.session_timeout_minutes = session_timeout_minutes
-
-    def create_session(self, session_id: Optional[str] = None) -> ChatSession:
-        """
-        Create a new chat session.
-
-        Args:
-            session_id: Optional custom session ID
-
-        Returns:
-            New ChatSession instance
-        """
-        session = ChatSession(session_id=session_id)
-        self.sessions[session.session_id] = session
-        logger.info(f"Created new session: {session.session_id}")
-        return session
-
-    def get_session(self, session_id: str) -> Optional[ChatSession]:
-        """
-        Retrieve a session by ID.
-
-        Args:
-            session_id: Session ID
-
-        Returns:
-            ChatSession or None if not found
-        """
-        session = self.sessions.get(session_id)
-
-        if session:
-            # Check if session has expired
-            elapsed_minutes = (
-                datetime.now() - session.last_activity
-            ).total_seconds() / 60
-
-            if elapsed_minutes > self.session_timeout_minutes:
-                logger.warning(f"Session {session_id} expired")
-                del self.sessions[session_id]
-                return None
-
-        return session
-
-    def delete_session(self, session_id: str) -> bool:
-        """
-        Delete a session.
-
-        Args:
-            session_id: Session ID
-
-        Returns:
-            True if deleted, False if not found
-        """
-        if session_id in self.sessions:
-            del self.sessions[session_id]
-            logger.info(f"Deleted session: {session_id}")
-            return True
-        return False
-
-    def cleanup_expired_sessions(self) -> int:
-        """
-        Remove all expired sessions.
-
-        Returns:
-            Number of sessions removed
-        """
-        expired_sessions = []
-
-        for session_id, session in self.sessions.items():
-            elapsed_minutes = (
-                datetime.now() - session.last_activity
-            ).total_seconds() / 60
-
-            if elapsed_minutes > self.session_timeout_minutes:
-                expired_sessions.append(session_id)
-
-        for session_id in expired_sessions:
-            del self.sessions[session_id]
-
-        if expired_sessions:
-            logger.info(f"Cleaned up {len(expired_sessions)} expired sessions")
-
-        return len(expired_sessions)
-
-    def get_session_count(self) -> int:
-        """Get number of active sessions."""
-        return len(self.sessions)

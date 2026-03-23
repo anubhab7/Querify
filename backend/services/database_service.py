@@ -1,18 +1,19 @@
 """
 Database service for PostgreSQL operations.
-Handles schema retrieval, query safety validation, and data sampling.
+Handles persistent app storage, target-database connections, schema retrieval,
+query safety validation, and data sampling.
 """
 
-import asyncpg
-import re
-from typing import List, Dict, Optional, Tuple
-from sqlparse import parse, sql
 import logging
+import re
 import socket
 import ssl as ssl_lib
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
+import asyncpg
 from asyncpg import exceptions as asyncpg_exceptions
+from sqlparse import parse
 
 logger = logging.getLogger(__name__)
 
@@ -28,61 +29,19 @@ class DatabaseConnectionError(Exception):
 
 
 class DatabaseService:
-    """Service for database operations with schema introspection and query validation."""
+    """Service for database operations with permanent and temporary pools."""
 
-    def __init__(self, connection_string: str):
-        """
-        Initialize the database service.
-
-        Args:
-            connection_string: PostgreSQL connection string
-        """
+    def __init__(
+        self,
+        connection_string: str,
+        *,
+        ssl: Optional[bool] = None,
+        permanent_pool: bool = False,
+    ):
         self.connection_string = connection_string
+        self.ssl = ssl
+        self.permanent_pool = permanent_pool
         self.pool: Optional[asyncpg.Pool] = None
-
-    async def connect(self) -> None:
-        """Create connection pool to PostgreSQL."""
-        try:
-            self.pool = await asyncpg.create_pool(
-                dsn=self.connection_string,
-                min_size=1,
-                max_size=5,
-                timeout=10,
-                command_timeout=10,
-            )
-            logger.info("Database connection pool created successfully")
-        except Exception as e:
-            classified_error = self._classify_connection_error(e)
-            logger.error(
-                "Failed to create database connection pool [%s]: %s",
-                classified_error.code,
-                classified_error.message,
-            )
-            raise classified_error from e
-
-    async def disconnect(self) -> None:
-        """Close connection pool."""
-        if self.pool:
-            await self.pool.close()
-            logger.info("Database connection pool closed")
-
-    async def test_connection(self) -> bool:
-        """
-        Test the database connection.
-
-        Returns:
-            True if connection is successful, False otherwise
-        """
-        try:
-            if not self.pool:
-                await self.connect()
-
-            async with self.pool.acquire() as connection:
-                result = await connection.fetchval("SELECT 1")
-                return result == 1
-        except Exception as e:
-            logger.error(f"Database connection test failed: {e}")
-            return False
 
     @classmethod
     def build_connection_string(
@@ -95,14 +54,299 @@ class DatabaseService:
         password: str,
     ) -> str:
         """Build a PostgreSQL connection string from discrete credentials."""
-        quoted_username = quote(username, safe="")
+        quoted_username = quote(username.strip(), safe="")
         quoted_password = quote(password, safe="")
-        quoted_host = host.strip()
-        quoted_database = quote(database, safe="")
+        quoted_database = quote(database.strip(), safe="")
         return (
             f"postgresql://{quoted_username}:{quoted_password}"
-            f"@{quoted_host}:{port}/{quoted_database}"
+            f"@{host.strip()}:{port}/{quoted_database}"
         )
+
+    @classmethod
+    def from_credentials(
+        cls,
+        *,
+        host: str,
+        port: int,
+        database: str,
+        username: str,
+        password: str,
+        ssl: Optional[bool] = None,
+        permanent_pool: bool = False,
+    ) -> "DatabaseService":
+        """Create a DatabaseService from discrete PostgreSQL credentials."""
+        return cls(
+            cls.build_connection_string(
+                host=host,
+                port=port,
+                database=database,
+                username=username,
+                password=password,
+            ),
+            ssl=ssl,
+            permanent_pool=permanent_pool,
+        )
+
+    async def __aenter__(self) -> "DatabaseService":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.disconnect()
+
+    async def connect(self) -> None:
+        """Create a connection pool to PostgreSQL."""
+        if self.pool is not None:
+            return
+
+        try:
+            pool_kwargs = {
+                "dsn": self.connection_string,
+                "timeout": 10,
+                "command_timeout": 20,
+                "ssl": self._build_ssl_config(self.ssl),
+            }
+            if self.permanent_pool:
+                pool_kwargs.update({"min_size": 1, "max_size": 5})
+            else:
+                pool_kwargs.update({"min_size": 1, "max_size": 1})
+
+            self.pool = await asyncpg.create_pool(**pool_kwargs)
+            logger.info(
+                "Database connection pool created successfully (permanent=%s)",
+                self.permanent_pool,
+            )
+        except Exception as e:
+            classified_error = self._classify_connection_error(e)
+            logger.error(
+                "Failed to create database connection pool [%s]: %s",
+                classified_error.code,
+                classified_error.message,
+            )
+            raise classified_error from e
+
+    async def disconnect(self) -> None:
+        """Close the connection pool."""
+        if self.pool:
+            await self.pool.close()
+            self.pool = None
+            logger.info("Database connection pool closed")
+
+    async def ensure_connected(self) -> None:
+        """Ensure the pool is connected before using it."""
+        if not self.pool:
+            await self.connect()
+
+    async def fetch(self, query: str, *args) -> List[asyncpg.Record]:
+        """Fetch multiple rows from the current database."""
+        await self.ensure_connected()
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:
+            return await connection.fetch(query, *args)
+
+    async def fetchrow(self, query: str, *args) -> Optional[asyncpg.Record]:
+        """Fetch a single row from the current database."""
+        await self.ensure_connected()
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:
+            return await connection.fetchrow(query, *args)
+
+    async def fetchval(self, query: str, *args) -> Any:
+        """Fetch a single scalar value from the current database."""
+        await self.ensure_connected()
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:
+            return await connection.fetchval(query, *args)
+
+    async def execute(self, query: str, *args) -> str:
+        """Execute a statement against the current database."""
+        await self.ensure_connected()
+        assert self.pool is not None
+        async with self.pool.acquire() as connection:
+            return await connection.execute(query, *args)
+
+    async def initialize_app_schema(self) -> None:
+        """Create or migrate the tables used for authentication and chat persistence."""
+        await self.ensure_connected()
+        assert self.pool is not None
+
+        async with self.pool.acquire() as connection:
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id UUID PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS email TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                UPDATE users
+                SET email = username
+                WHERE email IS NULL;
+                """
+            )
+            await connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique
+                ON users(email);
+                """
+            )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chats (
+                    id UUID PRIMARY KEY,
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    target_db_host TEXT,
+                    target_db_port INTEGER,
+                    target_db_name TEXT,
+                    target_db_user TEXT,
+                    target_db_password TEXT,
+                    target_db_ssl BOOLEAN,
+                    db_host TEXT NOT NULL,
+                    db_port INTEGER NOT NULL,
+                    db_name TEXT NOT NULL,
+                    db_username TEXT NOT NULL,
+                    db_password TEXT NOT NULL,
+                    db_ssl BOOLEAN,
+                    last_referenced_table TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS db_host TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS db_port INTEGER;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS db_name TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS db_username TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS db_password TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS db_ssl BOOLEAN;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS last_referenced_table TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE chats ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
+                """
+            )
+            await connection.execute(
+                """
+                UPDATE chats
+                SET
+                    db_host = COALESCE(db_host, target_db_host),
+                    db_port = COALESCE(db_port, target_db_port, 5432),
+                    db_name = COALESCE(db_name, target_db_name),
+                    db_username = COALESCE(db_username, target_db_user),
+                    db_password = COALESCE(db_password, target_db_password),
+                    db_ssl = COALESCE(db_ssl, target_db_ssl, true),
+                    updated_at = COALESCE(updated_at, last_activity, created_at, NOW())
+                WHERE
+                    db_host IS NULL
+                    OR db_port IS NULL
+                    OR db_name IS NULL
+                    OR db_username IS NULL
+                    OR db_password IS NULL
+                    OR db_ssl IS NULL
+                    OR updated_at IS NULL;
+                """
+            )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    id UUID PRIMARY KEY,
+                    chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+                    role TEXT,
+                    content TEXT,
+                    user_input TEXT NOT NULL,
+                    sql_query TEXT NOT NULL,
+                    explanation TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_input TEXT;
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+                """
+            )
+            await connection.execute(
+                """
+                UPDATE messages
+                SET
+                    user_input = COALESCE(user_input, content),
+                    created_at = COALESCE(created_at, timestamp, NOW())
+                WHERE user_input IS NULL OR created_at IS NULL;
+                """
+            )
+            await connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chats_user_id_created_at
+                    ON chats(user_id, created_at DESC);
+                """
+            )
+            await connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chats_user_id_updated_at
+                    ON chats(user_id, updated_at DESC);
+                """
+            )
+            await connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_messages_chat_id_created_at
+                    ON messages(chat_id, created_at ASC);
+                """
+            )
+
+    async def test_connection(self) -> bool:
+        """Test the current database connection."""
+        try:
+            result = await self.fetchval("SELECT 1")
+            return result == 1
+        except Exception as e:
+            logger.error("Database connection test failed: %s", e)
+            return False
 
     @classmethod
     async def test_credentials(
@@ -114,107 +358,62 @@ class DatabaseService:
         username: str,
         password: str,
         ssl: Optional[bool] = None,
-        ) -> None:
+    ) -> None:
         """
         Validate a set of PostgreSQL credentials using a short-lived pool.
 
         Raises:
             DatabaseConnectionError: If the connection attempt fails
         """
-        connection_string = cls.build_connection_string(
+        async with cls.from_credentials(
             host=host,
             port=port,
             database=database,
             username=username,
             password=password,
-        )
-
-        pool: Optional[asyncpg.Pool] = None
-        try:
-            ssl_config = cls._build_ssl_config(ssl)
-            pool = await asyncpg.create_pool(
-                dsn=connection_string,
-                min_size=1,
-                max_size=1,
-                timeout=10,
-                command_timeout=10,
-                ssl=ssl_config,
-            )
-            async with pool.acquire() as connection:
-                await connection.fetchval("SELECT 1")
-        except Exception as e:
-            raise cls._classify_connection_error(e) from e
-        finally:
-            if pool:
-                await pool.close()
+            ssl=ssl,
+            permanent_pool=False,
+        ) as service:
+            await service.fetchval("SELECT 1")
 
     async def get_compact_database_schema(self) -> str:
         """
         Retrieve the database schema in compact format.
 
         Returns schema as: schema.table: col1, col2, col3
-
-        Returns:
-            Formatted schema string
         """
-        if not self.pool:
-            await self.connect()
-
         try:
-            query = """
-                SELECT 
+            rows = await self.fetch(
+                """
+                SELECT
                     t.table_schema,
                     t.table_name,
-                    STRING_AGG(c.column_name, ', ' ORDER BY c.ordinal_position) as columns
-                FROM 
-                    information_schema.tables t
-                    LEFT JOIN information_schema.columns c 
-                    ON t.table_schema = c.table_schema 
+                    STRING_AGG(c.column_name, ', ' ORDER BY c.ordinal_position) AS columns
+                FROM information_schema.tables t
+                LEFT JOIN information_schema.columns c
+                    ON t.table_schema = c.table_schema
                     AND t.table_name = c.table_name
-                WHERE 
-                    t.table_schema NOT IN ('pg_catalog', 'information_schema')
-                GROUP BY 
-                    t.table_schema, t.table_name
-                ORDER BY 
-                    t.table_schema, t.table_name;
-            """
-
-            async with self.pool.acquire() as connection:
-                rows = await connection.fetch(query)
+                WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema')
+                GROUP BY t.table_schema, t.table_name
+                ORDER BY t.table_schema, t.table_name;
+                """
+            )
 
             schema_lines = []
             for row in rows:
-                schema_name = row["table_schema"]
-                table_name = row["table_name"]
-                columns = row["columns"] or ""
-                schema_lines.append(f"{schema_name}.{table_name}: {columns}")
-
+                schema_lines.append(
+                    f"{row['table_schema']}.{row['table_name']}: {row['columns'] or ''}"
+                )
             return "\n".join(schema_lines)
-
         except Exception as e:
-            logger.error(f"Error retrieving database schema: {e}")
+            logger.error("Error retrieving database schema: %s", e)
             raise
 
     async def get_column_value_samples(
         self, schema: str, table: str, column: str, limit: int = 5
     ) -> List[str]:
-        """
-        Fetch distinct values from a column to help LLM with filtering.
-
-        Args:
-            schema: Schema name
-            table: Table name
-            column: Column name
-            limit: Maximum number of samples to return (default 5)
-
-        Returns:
-            List of distinct values from the column
-        """
-        if not self.pool:
-            await self.connect()
-
+        """Fetch distinct values from a column to help the LLM with filtering."""
         try:
-            # Validate identifiers to prevent SQL injection
             if not self._is_valid_identifier(schema) or not self._is_valid_identifier(
                 table
             ):
@@ -230,37 +429,26 @@ class DatabaseService:
                 ORDER BY {column}
                 LIMIT {limit};
             """
-
-            async with self.pool.acquire() as connection:
-                rows = await connection.fetch(query)
-
+            rows = await self.fetch(query)
             return [str(row[column]) for row in rows]
-
         except Exception as e:
             logger.error(
-                f"Error retrieving column samples from {schema}.{table}.{column}: {e}"
+                "Error retrieving column samples from %s.%s.%s: %s",
+                schema,
+                table,
+                column,
+                e,
             )
             return []
 
     async def is_safe_select_query(self, query: str) -> Tuple[bool, Optional[str]]:
         """
         Validate that a query is safe to execute (only SELECT and WITH statements).
-
-        Strictly rejects queries containing INSERT, UPDATE, DELETE, DROP, ALTER, etc.
-
-        Args:
-            query: SQL query to validate
-
-        Returns:
-            Tuple of (is_safe: bool, error_message: Optional[str])
         """
         if not query or not query.strip():
             return False, "Query is empty"
 
-        # Normalize query
         normalized_query = query.strip()
-
-        # Check for dangerous keywords
         dangerous_patterns = [
             r"\bINSERT\b",
             r"\bUPDATE\b",
@@ -278,20 +466,16 @@ class DatabaseService:
             r"\bROLLBACK\b",
         ]
 
-        # Compile regex patterns (case-insensitive)
         for pattern in dangerous_patterns:
             if re.search(pattern, normalized_query, re.IGNORECASE):
                 return False, f"Query contains forbidden keyword: {pattern}"
 
-        # Parse query to validate structure
         try:
             parsed = parse(normalized_query)
-
             if not parsed:
                 return False, "Could not parse query"
 
             for statement in parsed:
-                # Get the first token (should be SELECT or WITH)
                 first_token = None
                 for token in statement.tokens:
                     if not token.is_whitespace:
@@ -301,62 +485,35 @@ class DatabaseService:
                 if first_token is None:
                     return False, "Query has no valid tokens"
 
-                token_type = first_token.ttype
                 token_value = str(first_token).upper().strip()
-
-                # Only allow SELECT and WITH statements
                 if token_value not in ("SELECT", "WITH"):
-                    return False, f"Only SELECT and WITH queries are allowed, got: {token_value}"
+                    return (
+                        False,
+                        f"Only SELECT and WITH queries are allowed, got: {token_value}",
+                    )
 
             return True, None
-
         except Exception as e:
-            logger.error(f"Error parsing query: {e}")
+            logger.error("Error parsing query: %s", e)
             return False, f"Could not parse query: {str(e)}"
 
-    async def execute_select_query(self, query: str) -> List[Dict]:
-        """
-        Execute a validated SELECT query and return results.
-
-        Args:
-            query: SELECT query to execute
-
-        Returns:
-            List of dictionaries containing query results
-
-        Raises:
-            ValueError: If query is not safe
-        """
+    async def execute_select_query(self, query: str) -> List[Dict[str, Any]]:
+        """Execute a validated SELECT query and return results."""
         is_safe, error_msg = await self.is_safe_select_query(query)
         if not is_safe:
             raise ValueError(f"Unsafe query: {error_msg}")
 
-        if not self.pool:
-            await self.connect()
-
         try:
-            async with self.pool.acquire() as connection:
-                rows = await connection.fetch(query)
-                return [dict(row) for row in rows]
-
+            rows = await self.fetch(query)
+            return [dict(row) for row in rows]
         except Exception as e:
-            logger.error(f"Error executing query: {e}")
+            logger.error("Error executing query: %s", e)
             raise
 
     @staticmethod
     def _is_valid_identifier(identifier: str) -> bool:
-        """
-        Validate if a string is a valid PostgreSQL identifier.
-
-        Args:
-            identifier: String to validate
-
-        Returns:
-            True if valid identifier, False otherwise
-        """
-        # PostgreSQL identifiers: alphanumeric, underscore, can start with letter or underscore
-        pattern = r"^[a-zA-Z_][a-zA-Z0-9_]*$"
-        return bool(re.match(pattern, identifier))
+        """Validate if a string is a valid PostgreSQL identifier."""
+        return bool(re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", identifier))
 
     @staticmethod
     def _classify_connection_error(error: Exception) -> DatabaseConnectionError:
@@ -439,7 +596,10 @@ class DatabaseService:
                     message="The database server refused the connection. Check the host and port.",
                     status_code=503,
                 )
-            if "name or service not known" in lowered or "nodename nor servname provided" in lowered:
+            if (
+                "name or service not known" in lowered
+                or "nodename nor servname provided" in lowered
+            ):
                 return DatabaseConnectionError(
                     code="HOST_RESOLUTION_FAILED",
                     message="The database host could not be resolved. Check the hostname.",
@@ -456,10 +616,6 @@ class DatabaseService:
     def _build_ssl_config(ssl_enabled: Optional[bool]):
         """
         Convert the API's boolean SSL flag into asyncpg SSL settings.
-
-        `ssl=True` means "require an encrypted connection".
-        `ssl=False` disables SSL.
-        `ssl=None` lets the driver choose its default behavior.
         """
         if ssl_enabled is None:
             return None

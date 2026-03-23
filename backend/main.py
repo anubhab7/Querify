@@ -1,93 +1,208 @@
 """
 Querify FastAPI Web Service
-Converts natural language to PostgreSQL queries using LLMs (Gemini & Perplexity)
+Refactored to persist chat state and authenticate users with JWTs.
 """
 
-import os
 import logging
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, status
+import jwt
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic_settings import BaseSettings
+from fastapi.security import OAuth2PasswordBearer
+from passlib.context import CryptContext
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from services.database_service import DatabaseService, DatabaseConnectionError
-from services.llm_service import LLMService
-from services.chat_session import ChatSessionManager, MessageRole
 from models.schema import (
-    QueryRequest,
-    QueryResponse,
+    AuthResponse,
+    ChatCreateRequest,
+    ChatHistoryResponse,
+    ChatSessionResponse,
+    ChatStatusResponse,
+    ChatSummary,
+    DatabaseConnectRequest,
+    DatabaseConnectResponse,
     KPIRequest,
     KPIResponse,
     KPISuggestion,
+    PersistedMessageResponse,
+    QueryRequest,
+    QueryResponse,
+    SchemaResponse,
     TestConnectionRequest,
     TestConnectionResponse,
-    DatabaseConnectRequest,
-    DatabaseConnectResponse,
-    SchemaRequest,
-    SchemaResponse,
-    ChatSessionRequest,
-    ChatSessionResponse,
-    ErrorResponse,
+    UserLoginRequest,
+    UserRegisterRequest,
+    UserResponse,
 )
+from services.chat_session import ChatSessionManager
+from services.database_service import DatabaseConnectionError, DatabaseService
+from services.llm_service import LLMService
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
 
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
-# Settings
+
 class Settings(BaseSettings):
     """Application settings from environment variables."""
 
     database_url: str = "postgresql://user:password@localhost:5432/querify_db"
+    app_database_url: Optional[str] = None
     gemini_api_key: Optional[str] = None
     perplexity_api_key: Optional[str] = None
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_debug: bool = False
-    cors_origins: list = [
+    cors_origins: list[str] = [
         "http://localhost:3000",
         "http://localhost:8080",
         "http://localhost:5173",
     ]
     max_history_messages: int = 8
+    jwt_secret_key: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60 * 24
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
+    model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
+
+    @property
+    def internal_database_url(self) -> str:
+        """Prefer APP_DATABASE_URL for app state, with DATABASE_URL as fallback."""
+        return self.app_database_url or self.database_url
 
 
-# Initialize settings
 settings = Settings()
 
-# Global services
-db_service: Optional[DatabaseService] = None
+app_db_service: Optional[DatabaseService] = None
 llm_service: Optional[LLMService] = None
 session_manager: Optional[ChatSessionManager] = None
 
 
+def hash_password(password: str) -> str:
+    """Hash a plaintext password."""
+    return pwd_context.hash(password)
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a plaintext password against its stored hash."""
+    return pwd_context.verify(password, password_hash)
+
+
+def create_access_token(user_id: str, email: str) -> str:
+    """Create a signed JWT for the authenticated user."""
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        minutes=settings.access_token_expire_minutes
+    )
+    payload = {
+        "sub": user_id,
+        "email": email,
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    """Resolve the current user from a Bearer token."""
+    if app_db_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Database service not initialized",
+        )
+
+    try:
+        payload = jwt.decode(
+            token,
+            settings.jwt_secret_key,
+            algorithms=[settings.jwt_algorithm],
+        )
+    except jwt.PyJWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token payload",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    row = await app_db_service.fetchrow(
+        """
+        SELECT id, email, created_at
+        FROM users
+        WHERE id = $1::uuid;
+        """,
+        user_id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return dict(row)
+
+
+async def require_services() -> tuple[DatabaseService, LLMService, ChatSessionManager]:
+    """Ensure the global services are available before handling a request."""
+    if app_db_service is None or llm_service is None or session_manager is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Services not initialized",
+        )
+    return app_db_service, llm_service, session_manager
+
+
+async def get_target_database_service(chat: dict) -> DatabaseService:
+    """Create a short-lived DatabaseService for the target database linked to a chat."""
+    return DatabaseService.from_credentials(
+        host=chat["db_host"],
+        port=chat["db_port"],
+        database=chat["db_name"],
+        username=chat["db_username"],
+        password=chat["db_password"],
+        ssl=chat["db_ssl"],
+        permanent_pool=False,
+    )
+
+
+def chat_title_from_request(request: ChatCreateRequest) -> str:
+    """Choose a stable chat title when the client does not provide one."""
+    if request.title and request.title.strip():
+        return request.title.strip()
+    return f"{request.database.strip()} @ {request.host.strip()}"
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifecycle management.
-    Handles startup and shutdown events.
-    """
-    global db_service, llm_service, session_manager
+    """Application lifecycle management."""
+    global app_db_service, llm_service, session_manager
 
-    # Startup
     logger.info("Starting Querify API...")
 
     try:
-        # Initialize services
-        db_service = DatabaseService(settings.database_url)
-        await db_service.connect()
-        logger.info("Database connection pool initialized")
+        app_db_service = DatabaseService(
+            settings.internal_database_url,
+            permanent_pool=True,
+        )
+        await app_db_service.connect()
+        await app_db_service.initialize_app_schema()
+        logger.info("App database connection pool initialized")
 
         llm_service = LLMService(
             gemini_api_key=settings.gemini_api_key,
@@ -95,44 +210,34 @@ async def lifespan(app: FastAPI):
         )
         logger.info("LLM service initialized")
 
-        session_manager = ChatSessionManager()
-        logger.info("Session manager initialized")
-
+        session_manager = ChatSessionManager(
+            app_db=app_db_service,
+            max_history=settings.max_history_messages,
+        )
+        logger.info("Persistent chat session manager initialized")
         logger.info("Querify API started successfully")
-
     except Exception as e:
-        logger.error(f"Failed to start application: {e}")
+        logger.error("Failed to start application: %s", e)
         raise
 
     yield
 
-    # Shutdown
     logger.info("Shutting down Querify API...")
-
     try:
-        if db_service:
-            await db_service.disconnect()
-            logger.info("Database connection pool closed")
-
-        if session_manager:
-            removed = session_manager.cleanup_expired_sessions()
-            logger.info(f"Cleaned up {removed} expired sessions")
-
-        logger.info("Querify API shutdown complete")
-
+        if app_db_service:
+            await app_db_service.disconnect()
+            logger.info("App database connection pool closed")
     except Exception as e:
-        logger.error(f"Error during shutdown: {e}")
+        logger.error("Error during shutdown: %s", e)
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Querify API",
     description="Convert Natural Language to PostgreSQL queries using LLMs",
-    version="1.0.0",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
-# Configure CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
@@ -147,26 +252,90 @@ async def database_connection_exception_handler(request, exc: DatabaseConnection
     """Return structured connection errors for database auth/connectivity issues."""
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": exc.code,
-            "detail": exc.message,
-        },
+        content={"error": exc.code, "detail": exc.message},
     )
-
-
-# ============================================================================
-# Health & Connection Check Endpoints
-# ============================================================================
 
 
 @app.get("/health", response_model=dict, tags=["Health"])
 async def health_check():
     """Health check endpoint."""
-    return {
-        "status": "ok",
-        "service": "querify",
-        "version": "1.0.0",
-    }
+    return {"status": "ok", "service": "querify", "version": "2.0.0"}
+
+
+@app.post("/auth/register", response_model=AuthResponse, tags=["Authentication"])
+async def register(request: UserRegisterRequest):
+    """Register a new user and return a JWT."""
+    app_db, _, _ = await require_services()
+    email = request.email.lower()
+
+    existing_user = await app_db.fetchrow(
+        "SELECT id FROM users WHERE email = $1;",
+        email,
+    )
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A user with this email already exists",
+        )
+
+    user_id = str(uuid.uuid4())
+    password_hash = hash_password(request.password.get_secret_value())
+    row = await app_db.fetchrow(
+        """
+        INSERT INTO users (id, username, email, password_hash)
+        VALUES ($1::uuid, $2, $3, $4)
+        RETURNING id, email, created_at;
+        """,
+        user_id,
+        email,
+        email,
+        password_hash,
+    )
+    assert row is not None
+
+    token = create_access_token(user_id=str(row["id"]), email=row["email"])
+    return AuthResponse(
+        access_token=token,
+        user=UserResponse(
+            id=str(row["id"]),
+            email=row["email"],
+            created_at=row["created_at"],
+        ),
+    )
+
+
+@app.post("/auth/login", response_model=AuthResponse, tags=["Authentication"])
+async def login(request: UserLoginRequest):
+    """Authenticate a user and return a JWT."""
+    app_db, _, _ = await require_services()
+    email = request.email.lower()
+
+    row = await app_db.fetchrow(
+        """
+        SELECT id, email, password_hash, created_at
+        FROM users
+        WHERE email = $1;
+        """,
+        email,
+    )
+    if row is None or not verify_password(
+        request.password.get_secret_value(), row["password_hash"]
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = create_access_token(user_id=str(row["id"]), email=row["email"])
+    return AuthResponse(
+        access_token=token,
+        user=UserResponse(
+            id=str(row["id"]),
+            email=row["email"],
+            created_at=row["created_at"],
+        ),
+    )
 
 
 @app.post(
@@ -175,39 +344,25 @@ async def health_check():
     tags=["Database"],
 )
 async def test_connection(request: TestConnectionRequest = TestConnectionRequest()):
-    """
-    Test database connection.
-
-    Returns:
-        Connection status and result
-    """
-    if not db_service:
+    """Test the app database connection."""
+    if app_db_service is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Database service not initialized",
         )
 
-    try:
-        success = await db_service.test_connection()
-
-        if success:
-            return TestConnectionResponse(
-                success=True,
-                message="Database connection successful",
-                database="querify_db",
-            )
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database connection failed",
-            )
-
-    except Exception as e:
-        logger.error(f"Connection test failed: {e}")
+    success = await app_db_service.test_connection()
+    if not success:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Connection test error: {str(e)}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed",
         )
+
+    return TestConnectionResponse(
+        success=True,
+        message="Database connection successful",
+        database="app_state",
+    )
 
 
 @app.post(
@@ -216,12 +371,7 @@ async def test_connection(request: TestConnectionRequest = TestConnectionRequest
     tags=["Database"],
 )
 async def connect_to_user_database(request: DatabaseConnectRequest):
-    """
-    Test a user-supplied PostgreSQL connection without replacing the app's main database.
-
-    Returns:
-        Connection status and the database target that was tested
-    """
+    """Test a user-supplied PostgreSQL connection without storing it."""
     try:
         await DatabaseService.test_credentials(
             host=request.host.strip(),
@@ -231,7 +381,6 @@ async def connect_to_user_database(request: DatabaseConnectRequest):
             password=request.password.get_secret_value(),
             ssl=request.ssl,
         )
-
         return DatabaseConnectResponse(
             success=True,
             message="Database connection successful",
@@ -240,11 +389,10 @@ async def connect_to_user_database(request: DatabaseConnectRequest):
             port=request.port,
             ssl=request.ssl,
         )
-
     except DatabaseConnectionError:
         raise
     except Exception as e:
-        logger.error(f"Unexpected database connection error: {e}")
+        logger.error("Unexpected database connection error: %s", e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
@@ -254,90 +402,183 @@ async def connect_to_user_database(request: DatabaseConnectRequest):
         )
 
 
-# ============================================================================
-# Schema Endpoints
-# ============================================================================
+@app.post("/chats", response_model=ChatSessionResponse, tags=["Chats"])
+async def create_chat(
+    request: ChatCreateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Create a new persistent chat with target DB credentials."""
+    _, _, chats = await require_services()
+
+    await DatabaseService.test_credentials(
+        host=request.host.strip(),
+        port=request.port,
+        database=request.database.strip(),
+        username=request.username.strip(),
+        password=request.password.get_secret_value(),
+        ssl=request.ssl,
+    )
+
+    chat = await chats.create_chat(
+        user_id=str(current_user["id"]),
+        title=chat_title_from_request(request),
+        host=request.host,
+        port=request.port,
+        database=request.database,
+        username=request.username,
+        password=request.password.get_secret_value(),
+        ssl=request.ssl,
+    )
+    return ChatSessionResponse(
+        session_id=str(chat["id"]),
+        title=chat["title"],
+        created_at=chat["created_at"],
+        last_referenced_table=chat["last_referenced_table"],
+    )
+
+
+@app.get("/chats", response_model=list[ChatSummary], tags=["Chats"])
+async def list_chats(current_user: dict = Depends(get_current_user)):
+    """List all chats for the authenticated user."""
+    _, _, chats = await require_services()
+    chat_rows = await chats.list_chats(str(current_user["id"]))
+    return [
+        ChatSummary(
+            id=str(chat["id"]),
+            title=chat["title"],
+            created_at=chat["created_at"],
+            updated_at=chat["updated_at"],
+            last_referenced_table=chat["last_referenced_table"],
+        )
+        for chat in chat_rows
+    ]
+
+
+@app.get(
+    "/chats/{chat_id}/history",
+    response_model=ChatHistoryResponse,
+    tags=["Chats"],
+)
+async def get_chat_history(
+    chat_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Fetch all persisted messages for a specific chat."""
+    _, _, chats = await require_services()
+    chat = await chats.get_chat(chat_id, str(current_user["id"]))
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat {chat_id} not found",
+        )
+
+    history = await chats.get_chat_history(chat_id, str(current_user["id"]))
+    return ChatHistoryResponse(
+        chat_id=str(chat["id"]),
+        title=chat["title"],
+        messages=[
+            PersistedMessageResponse(
+                id=str(message["id"]),
+                chat_id=str(message["chat_id"]),
+                user_input=message["user_input"],
+                sql_query=message["sql_query"],
+                explanation=message["explanation"],
+                created_at=message["created_at"],
+            )
+            for message in history
+        ],
+    )
+
+
+@app.get(
+    "/chats/{chat_id}/status",
+    response_model=ChatStatusResponse,
+    tags=["Chats"],
+)
+async def get_chat_status(
+    chat_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Check if the target database linked to the chat is reachable right now."""
+    _, _, chats = await require_services()
+    chat = await chats.get_chat(chat_id, str(current_user["id"]))
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat {chat_id} not found",
+        )
+
+    try:
+        await DatabaseService.test_credentials(
+            host=chat["db_host"],
+            port=chat["db_port"],
+            database=chat["db_name"],
+            username=chat["db_username"],
+            password=chat["db_password"],
+            ssl=chat["db_ssl"],
+        )
+        return ChatStatusResponse(
+            chat_id=str(chat["id"]),
+            reachable=True,
+            message="Target database is reachable",
+        )
+    except DatabaseConnectionError as exc:
+        return ChatStatusResponse(
+            chat_id=str(chat["id"]),
+            reachable=False,
+            message=exc.message,
+        )
 
 
 @app.get("/schema", response_model=SchemaResponse, tags=["Database"])
-async def get_schema(request: SchemaRequest = SchemaRequest()):
-    """
-    Get compact database schema.
-
-    Returns:
-        Formatted schema: schema.table: col1, col2, col3
-    """
-    if not db_service:
+async def get_schema(
+    session_id: str = Query(..., description="Chat session ID"),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get the compact schema for the target database linked to a chat."""
+    _, _, chats = await require_services()
+    chat = await chats.get_chat(session_id, str(current_user["id"]))
+    if chat is None:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database service not initialized",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat {session_id} not found",
         )
 
-    try:
-        schema = await db_service.get_compact_database_schema()
-
-        return SchemaResponse(schema=schema)
-
-    except Exception as e:
-        logger.error(f"Error retrieving schema: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error retrieving schema: {str(e)}",
-        )
-
-
-# ============================================================================
-# Query Generation Endpoints
-# ============================================================================
+    async with await get_target_database_service(chat) as target_db:
+        schema = await target_db.get_compact_database_schema()
+    return SchemaResponse(schema=schema)
 
 
 @app.post("/query", response_model=QueryResponse, tags=["Query Generation"])
-async def generate_query(request: QueryRequest):
-    """
-    Generate SQL query from natural language input.
+async def generate_query(
+    request: QueryRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate, validate, execute, and persist a SQL query for a chat."""
+    _, llm, chats = await require_services()
 
-    Args:
-        request: QueryRequest with user_input, optional session_id, preferred_model
-
-    Returns:
-        Generated SQL query, explanation, and results (if applicable)
-    """
-    if not db_service or not llm_service or not session_manager:
+    if not request.user_input.strip():
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Services not initialized",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="user_input cannot be empty",
         )
 
-    try:
-        # Validate input
-        if not request.user_input or not request.user_input.strip():
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="user_input cannot be empty",
-            )
+    chat = await chats.get_chat(request.session_id, str(current_user["id"]))
+    if chat is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat {request.session_id} not found",
+        )
 
-        # Get or create session
-        if request.session_id:
-            session = session_manager.get_session(request.session_id)
-            if not session:
-                logger.warning(
-                    f"Session {request.session_id} not found, creating new"
-                )
-                session = session_manager.create_session(request.session_id)
-        else:
-            session = session_manager.create_session()
+    resolved_input = await chats.resolve_pronouns(request.session_id, request.user_input)
+    history = await chats.get_recent_messages_for_llm(
+        request.session_id,
+        str(current_user["id"]),
+    )
 
-        # Resolve pronouns in user input
-        resolved_input = session.resolve_pronouns(request.user_input)
-
-        # Get database schema
-        schema = await db_service.get_compact_database_schema()
-
-        # Get chat history
-        history = session.get_history(include_system=False)
-
-        # Generate SQL query
-        sql_query, explanation, model_used = await llm_service.generate_sql_query(
+    async with await get_target_database_service(chat) as target_db:
+        schema = await target_db.get_compact_database_schema()
+        sql_query, explanation, _model_used = await llm.generate_sql_query(
             user_input=resolved_input,
             database_schema=schema,
             chat_history=history,
@@ -345,216 +586,114 @@ async def generate_query(request: QueryRequest):
         )
 
         if not sql_query:
-            # Add to history and return error response
-            session.add_message(MessageRole.USER, resolved_input)
-            session.add_message(
-                MessageRole.ASSISTANT,
-                f"Could not generate SQL query. Please try rephrasing your question.",
-            )
-
             return QueryResponse(
-                session_id=session.session_id,
+                session_id=request.session_id,
                 sql_query="",
                 explanation=explanation or "Failed to generate query",
                 results=[],
                 error="Could not generate SQL query",
             )
 
-        # Validate query safety
-        is_safe, error_msg = await db_service.is_safe_select_query(sql_query)
-
+        is_safe, error_msg = await target_db.is_safe_select_query(sql_query)
         if not is_safe:
-            session.add_message(MessageRole.USER, resolved_input)
-            session.add_message(
-                MessageRole.ASSISTANT,
-                f"Generated query is not safe to execute: {error_msg}",
-            )
-
             return QueryResponse(
-                session_id=session.session_id,
+                session_id=request.session_id,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
                 error=f"Query validation failed: {error_msg}",
             )
 
-        # Execute query
         try:
-            results = await db_service.execute_select_query(sql_query)
+            results = await target_db.execute_select_query(sql_query)
         except Exception as e:
-            logger.error(f"Query execution failed: {e}")
-            results = []
-
+            logger.error("Query execution failed: %s", e)
             return QueryResponse(
-                session_id=session.session_id,
+                session_id=request.session_id,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
                 error=f"Query execution error: {str(e)}",
             )
 
-        # Update session with query context
-        session.add_message(MessageRole.USER, resolved_input)
-        session.add_message(MessageRole.ASSISTANT, explanation or "")
-        session.update_last_referenced_table(sql_query)
+    await chats.append_query_message(
+        chat_id=request.session_id,
+        user_input=resolved_input,
+        sql_query=sql_query,
+        explanation=explanation or "",
+    )
+    await chats.update_last_referenced_table(request.session_id, sql_query)
 
-        return QueryResponse(
-            session_id=session.session_id,
-            sql_query=sql_query,
-            explanation=explanation or "",
-            results=results,
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error generating query: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error generating query: {str(e)}",
-        )
-
-
-# ============================================================================
-# KPI Suggestion Endpoints
-# ============================================================================
-
-
-@app.post("/kpis", response_model=KPIResponse, tags=["KPI Suggestions"])
-async def get_kpi_suggestions(request: KPIRequest):
-    """
-    Generate business KPI suggestions based on database schema.
-
-    Args:
-        request: KPIRequest with optional database_schema
-
-    Returns:
-        List of 4 suggested KPIs with explanations
-    """
-    if not db_service or not llm_service:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Services not initialized",
-        )
-
-    try:
-        # Get schema if not provided
-        schema = request.database_schema
-        if not schema:
-            schema = await db_service.get_compact_database_schema()
-
-        if not schema:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Could not retrieve database schema",
-            )
-
-        # Generate KPI suggestions
-        kpis, explanation, model_used = await llm_service.generate_kpi_suggestions(
-            database_schema=schema,
-            preferred_model="gemini",
-        )
-
-        if not kpis:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to generate KPI suggestions",
-            )
-
-        # Convert to KPISuggestion objects
-        kpi_suggestions = [
-            KPISuggestion(
-                number=kpi.get("number", i + 1),
-                name=kpi.get("name", ""),
-                description=kpi.get("description", ""),
-            )
-            for i, kpi in enumerate(kpis[:4])  # Limit to 4
-        ]
-
-        return KPIResponse(
-            kpis=kpi_suggestions,
-            explanation=explanation or "KPI suggestions generated successfully",
-        )
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error generating KPI suggestions: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error generating KPI suggestions: {str(e)}",
-        )
-
-
-# ============================================================================
-# Chat Session Endpoints
-# ============================================================================
-
-
-@app.get("/session/{session_id}", response_model=ChatSessionResponse, tags=["Sessions"])
-async def get_session(session_id: str):
-    """
-    Retrieve chat session data.
-
-    Args:
-        session_id: Session ID
-
-    Returns:
-        Session data with message history
-    """
-    if not session_manager:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Session manager not initialized",
-        )
-
-    session = session_manager.get_session(session_id)
-
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
-        )
-
-    return ChatSessionResponse(
-        session_id=session.session_id,
-        messages=[
-            {"role": m.role.value, "content": m.content}
-            for m in session.get_history()
-        ],
-        last_referenced_table=session.last_referenced_table,
+    return QueryResponse(
+        session_id=request.session_id,
+        sql_query=sql_query,
+        explanation=explanation or "",
+        results=results,
     )
 
 
-@app.delete("/session/{session_id}", tags=["Sessions"])
-async def delete_session(session_id: str):
-    """
-    Delete a chat session.
-
-    Args:
-        session_id: Session ID
-
-    Returns:
-        Success message
-    """
-    if not session_manager:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Session manager not initialized",
-        )
-
-    if session_manager.delete_session(session_id):
-        return {"message": f"Session {session_id} deleted"}
-    else:
+@app.post("/kpis", response_model=KPIResponse, tags=["KPI Suggestions"])
+async def get_kpi_suggestions(
+    request: KPIRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Generate KPI suggestions for the target database linked to a chat."""
+    _, llm, chats = await require_services()
+    chat = await chats.get_chat(request.session_id, str(current_user["id"]))
+    if chat is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Session {session_id} not found",
+            detail=f"Chat {request.session_id} not found",
         )
 
+    schema = request.database_schema
+    if not schema:
+        async with await get_target_database_service(chat) as target_db:
+            schema = await target_db.get_compact_database_schema()
 
-# ============================================================================
-# Error Handlers
-# ============================================================================
+    if not schema:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Could not retrieve database schema",
+        )
+
+    kpis, explanation, _model_used = await llm.generate_kpi_suggestions(
+        database_schema=schema,
+        preferred_model="gemini",
+    )
+    if not kpis:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate KPI suggestions",
+        )
+
+    return KPIResponse(
+        kpis=[
+            KPISuggestion(
+                number=kpi.get("number", index + 1),
+                name=kpi.get("name", ""),
+                description=kpi.get("description", ""),
+            )
+            for index, kpi in enumerate(kpis[:4])
+        ],
+        explanation=explanation or "KPI suggestions generated successfully",
+    )
+
+
+@app.delete("/chats/{chat_id}", tags=["Chats"])
+async def delete_chat(
+    chat_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Delete a chat and its persisted history."""
+    _, _, chats = await require_services()
+    deleted = await chats.delete_chat(chat_id, str(current_user["id"]))
+    if not deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Chat {chat_id} not found",
+        )
+    return {"message": f"Chat {chat_id} deleted"}
 
 
 @app.exception_handler(HTTPException)
@@ -562,17 +701,14 @@ async def http_exception_handler(request, exc):
     """Custom HTTP exception handler."""
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": exc.detail or "Internal server error",
-            "status_code": exc.status_code,
-        },
+        content={"error": exc.detail or "Internal server error", "status_code": exc.status_code},
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
     """General exception handler."""
-    logger.error(f"Unhandled exception: {exc}")
+    logger.error("Unhandled exception: %s", exc)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={
