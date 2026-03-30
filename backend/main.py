@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from models.schema import (
@@ -73,6 +74,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 60 * 24
 
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, value):
+        """Allow CORS origins to be provided as a JSON array or comma-separated string."""
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
     @property
@@ -86,6 +95,28 @@ settings = Settings()
 app_db_service: Optional[DatabaseService] = None
 llm_service: Optional[LLMService] = None
 session_manager: Optional[ChatSessionManager] = None
+
+
+def api_error_payload(error: str, detail: Optional[str] = None) -> dict:
+    """Create a consistent API error response payload."""
+    payload = {"error": error}
+    if detail:
+        payload["detail"] = detail
+    return payload
+
+
+def raise_api_error(
+    status_code: int,
+    error: str,
+    detail: Optional[str] = None,
+    headers: Optional[dict] = None,
+) -> None:
+    """Raise a FastAPI HTTPException with a normalized payload."""
+    raise HTTPException(
+        status_code=status_code,
+        detail=api_error_payload(error, detail),
+        headers=headers,
+    )
 
 
 def hash_password(password: str) -> str:
@@ -114,9 +145,10 @@ def create_access_token(user_id: str, email: str) -> str:
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     """Resolve the current user from a Bearer token."""
     if app_db_service is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database service not initialized",
+        raise_api_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "SERVICE_INITIALIZATION_FAILED",
+            "Database service not initialized",
         )
 
     try:
@@ -128,15 +160,16 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     except jwt.PyJWTError as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired token",
+            detail=api_error_payload("INVALID_TOKEN", "Invalid or expired token"),
             headers={"WWW-Authenticate": "Bearer"},
         ) from exc
 
     user_id = payload.get("sub")
     if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload",
+        raise_api_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "INVALID_TOKEN",
+            "Invalid token payload",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -149,9 +182,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
         user_id,
     )
     if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
+        raise_api_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "USER_NOT_FOUND",
+            "User not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -161,9 +195,10 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
 async def require_services() -> tuple[DatabaseService, LLMService, ChatSessionManager]:
     """Ensure the global services are available before handling a request."""
     if app_db_service is None or llm_service is None or session_manager is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Services not initialized",
+        raise_api_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "SERVICE_INITIALIZATION_FAILED",
+            "Services not initialized",
         )
     return app_db_service, llm_service, session_manager
 
@@ -273,9 +308,10 @@ async def register(request: UserRegisterRequest):
         email,
     )
     if existing_user:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="A user with this email already exists",
+        raise_api_error(
+            status.HTTP_409_CONFLICT,
+            "USER_ALREADY_EXISTS",
+            "A user with this email already exists",
         )
 
     user_id = str(uuid.uuid4())
@@ -321,9 +357,10 @@ async def login(request: UserLoginRequest):
     if row is None or not verify_password(
         request.password.get_secret_value(), row["password_hash"]
     ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password",
+        raise_api_error(
+            status.HTTP_401_UNAUTHORIZED,
+            "INVALID_CREDENTIALS",
+            "Invalid email or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -346,16 +383,18 @@ async def login(request: UserLoginRequest):
 async def test_connection(request: TestConnectionRequest = TestConnectionRequest()):
     """Test the app database connection."""
     if app_db_service is None:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Database service not initialized",
+        raise_api_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "SERVICE_INITIALIZATION_FAILED",
+            "Database service not initialized",
         )
 
     success = await app_db_service.test_connection()
     if not success:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Database connection failed",
+        raise_api_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "CONNECTION_FAILED",
+            "Database connection failed",
         )
 
     return TestConnectionResponse(
@@ -393,12 +432,10 @@ async def connect_to_user_database(request: DatabaseConnectRequest):
         raise
     except Exception as e:
         logger.error("Unexpected database connection error: %s", e)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "CONNECTION_FAILED",
-                "detail": f"Unexpected database connection error: {str(e)}",
-            },
+        raise_api_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "CONNECTION_FAILED",
+            f"Unexpected database connection error: {str(e)}",
         )
 
 
@@ -467,9 +504,10 @@ async def get_chat_history(
     _, _, chats = await require_services()
     chat = await chats.get_chat(chat_id, str(current_user["id"]))
     if chat is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat {chat_id} not found",
+        raise_api_error(
+            status.HTTP_404_NOT_FOUND,
+            "CHAT_NOT_FOUND",
+            f"Chat {chat_id} not found",
         )
 
     history = await chats.get_chat_history(chat_id, str(current_user["id"]))
@@ -503,9 +541,10 @@ async def get_chat_status(
     _, _, chats = await require_services()
     chat = await chats.get_chat(chat_id, str(current_user["id"]))
     if chat is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat {chat_id} not found",
+        raise_api_error(
+            status.HTTP_404_NOT_FOUND,
+            "CHAT_NOT_FOUND",
+            f"Chat {chat_id} not found",
         )
 
     try:
@@ -539,9 +578,10 @@ async def get_schema(
     _, _, chats = await require_services()
     chat = await chats.get_chat(session_id, str(current_user["id"]))
     if chat is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat {session_id} not found",
+        raise_api_error(
+            status.HTTP_404_NOT_FOUND,
+            "CHAT_NOT_FOUND",
+            f"Chat {session_id} not found",
         )
 
     async with await get_target_database_service(chat) as target_db:
@@ -558,16 +598,18 @@ async def generate_query(
     _, llm, chats = await require_services()
 
     if not request.user_input.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="user_input cannot be empty",
+        raise_api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "INVALID_INPUT",
+            "user_input cannot be empty",
         )
 
     chat = await chats.get_chat(request.session_id, str(current_user["id"]))
     if chat is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat {request.session_id} not found",
+        raise_api_error(
+            status.HTTP_404_NOT_FOUND,
+            "CHAT_NOT_FOUND",
+            f"Chat {request.session_id} not found",
         )
 
     resolved_input = await chats.resolve_pronouns(request.session_id, request.user_input)
@@ -641,9 +683,10 @@ async def get_kpi_suggestions(
     _, llm, chats = await require_services()
     chat = await chats.get_chat(request.session_id, str(current_user["id"]))
     if chat is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat {request.session_id} not found",
+        raise_api_error(
+            status.HTTP_404_NOT_FOUND,
+            "CHAT_NOT_FOUND",
+            f"Chat {request.session_id} not found",
         )
 
     schema = request.database_schema
@@ -652,9 +695,10 @@ async def get_kpi_suggestions(
             schema = await target_db.get_compact_database_schema()
 
     if not schema:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Could not retrieve database schema",
+        raise_api_error(
+            status.HTTP_400_BAD_REQUEST,
+            "SCHEMA_UNAVAILABLE",
+            "Could not retrieve database schema",
         )
 
     kpis, explanation, _model_used = await llm.generate_kpi_suggestions(
@@ -662,9 +706,10 @@ async def get_kpi_suggestions(
         preferred_model="gemini",
     )
     if not kpis:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate KPI suggestions",
+        raise_api_error(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "KPI_GENERATION_FAILED",
+            "Failed to generate KPI suggestions",
         )
 
     return KPIResponse(
@@ -689,9 +734,10 @@ async def delete_chat(
     _, _, chats = await require_services()
     deleted = await chats.delete_chat(chat_id, str(current_user["id"]))
     if not deleted:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Chat {chat_id} not found",
+        raise_api_error(
+            status.HTTP_404_NOT_FOUND,
+            "CHAT_NOT_FOUND",
+            f"Chat {chat_id} not found",
         )
     return {"message": f"Chat {chat_id} deleted"}
 
@@ -699,9 +745,22 @@ async def delete_chat(
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request, exc):
     """Custom HTTP exception handler."""
+    detail = exc.detail
+
+    if isinstance(detail, dict):
+        error = detail.get("error", "REQUEST_FAILED")
+        detail_text = detail.get("detail")
+    else:
+        error = str(detail or "REQUEST_FAILED")
+        detail_text = None
+
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": exc.detail or "Internal server error", "status_code": exc.status_code},
+        content={
+            "error": error,
+            "detail": detail_text,
+            "status_code": exc.status_code,
+        },
     )
 
 
