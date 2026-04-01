@@ -206,6 +206,18 @@ class ChatSessionManager:
             chat_id,
         )
 
+    async def update_title(self, chat_id: str, title: str) -> None:
+        """Update the persisted title for a chat."""
+        await self.app_db.execute(
+            """
+            UPDATE chats
+            SET title = $2, updated_at = NOW()
+            WHERE id = $1::uuid;
+            """,
+            chat_id,
+            title,
+        )
+
     async def update_last_referenced_table(self, chat_id: str, sql_query: str) -> None:
         """Persist the last table referenced by the generated SQL query."""
         table_name = self._extract_table_from_query(sql_query)

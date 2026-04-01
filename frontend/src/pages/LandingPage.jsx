@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { Database, Lock, ShieldCheck } from "lucide-react";
+import { Database, LoaderCircle, Lock, ShieldCheck } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -83,15 +83,17 @@ export default function LandingPage() {
           initial={{ opacity: 0, x: 20 }}
           animate={{ opacity: 1, x: 0 }}
           onSubmit={handleSubmit}
-          className="glass-panel rounded-[32px] border border-slate-200 p-7 shadow-soft"
+          className="rounded-[32px] border border-gray-200 bg-white/90 p-7 shadow-sm backdrop-blur"
         >
-          <div className="mb-6 flex items-center gap-3">
-            <div className="rounded-2xl bg-slate-900 p-3 text-white">
-              <Database className="h-5 w-5" />
-            </div>
-            <div>
-              <h2 className="text-2xl font-semibold text-slate-900">Connect Database</h2>
-              <p className="text-sm text-slate-500">Create a new chat session from fresh credentials.</p>
+          <div className="mb-6 rounded-3xl border border-slate-200 bg-slate-50/80 p-5">
+            <div className="flex items-center gap-3">
+              <div className="rounded-2xl bg-slate-900 p-3 text-white">
+                <Database className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-2xl font-semibold tracking-tight text-slate-900">Connect Database</h2>
+                <p className="text-sm leading-6 text-slate-500">Create a fresh workspace with your PostgreSQL credentials.</p>
+              </div>
             </div>
           </div>
 
@@ -101,7 +103,7 @@ export default function LandingPage() {
                 required
                 value={form.host}
                 onChange={(event) => setForm((current) => ({ ...current, host: event.target.value }))}
-                className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-indigo-400"
+                className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-slate-900 shadow-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
               />
             </Field>
             <Field label="Port">
@@ -110,7 +112,7 @@ export default function LandingPage() {
                 type="number"
                 value={form.port}
                 onChange={(event) => setForm((current) => ({ ...current, port: Number(event.target.value) }))}
-                className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-indigo-400"
+                className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-slate-900 shadow-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
               />
             </Field>
             <Field label="Database Name">
@@ -118,7 +120,7 @@ export default function LandingPage() {
                 required
                 value={form.database}
                 onChange={(event) => setForm((current) => ({ ...current, database: event.target.value }))}
-                className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-indigo-400"
+                className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-slate-900 shadow-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
               />
             </Field>
             <Field label="Username">
@@ -126,7 +128,7 @@ export default function LandingPage() {
                 required
                 value={form.username}
                 onChange={(event) => setForm((current) => ({ ...current, username: event.target.value }))}
-                className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-indigo-400"
+                className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-slate-900 shadow-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
               />
             </Field>
             <Field label="Password" className="sm:col-span-2">
@@ -135,15 +137,15 @@ export default function LandingPage() {
                 type="password"
                 value={form.password}
                 onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))}
-                className="w-full rounded-2xl border border-slate-200 px-4 py-3 outline-none transition focus:border-indigo-400"
+                className="w-full rounded-xl border border-gray-200 bg-white px-4 py-3 text-slate-900 shadow-sm outline-none transition focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
               />
             </Field>
           </div>
 
-          <label className="mt-5 flex items-center justify-between rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4">
+          <label className="mt-5 flex items-center justify-between rounded-xl border border-gray-200 bg-slate-50/80 px-4 py-4 shadow-sm">
             <div>
               <p className="text-sm font-medium text-slate-800">Require SSL</p>
-              <p className="text-sm text-slate-500">Enable this when your PostgreSQL server expects secure connections.</p>
+              <p className="text-sm leading-6 text-slate-500">Enable this when your PostgreSQL server expects secure connections.</p>
             </div>
             <input
               type="checkbox"
@@ -156,9 +158,16 @@ export default function LandingPage() {
           <button
             type="submit"
             disabled={submitting}
-            className="mt-6 inline-flex w-full items-center justify-center rounded-2xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:bg-slate-300"
+            className="mt-6 inline-flex w-full items-center justify-center gap-2 rounded-xl bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition hover:bg-indigo-600 disabled:bg-slate-300"
           >
-            {submitting ? "Connecting..." : "Start New Chat"}
+            {submitting ? (
+              <>
+                <LoaderCircle className="h-4 w-4 animate-spin" />
+                Connecting to database
+              </>
+            ) : (
+              "Start New Chat"
+            )}
           </button>
         </motion.form>
       </div>

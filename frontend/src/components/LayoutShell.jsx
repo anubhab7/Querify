@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router-dom";
 import { LogOut, Plus } from "lucide-react";
 
@@ -9,9 +10,16 @@ export default function LayoutShell() {
   const { logout, user } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    return localStorage.getItem("querify_sidebar_collapsed") === "true";
+  });
   const activeChatId = location.pathname.startsWith("/chat/")
     ? location.pathname.split("/")[2]
     : null;
+
+  useEffect(() => {
+    localStorage.setItem("querify_sidebar_collapsed", String(sidebarCollapsed));
+  }, [sidebarCollapsed]);
 
   const onLogout = () => {
     logout();
@@ -20,8 +28,16 @@ export default function LayoutShell() {
 
   return (
     <div className="flex min-h-screen bg-brand-background text-slate-900">
-      <Sidebar activeChatId={activeChatId} />
-      <div className="flex min-h-screen flex-1 flex-col">
+      <Sidebar
+        activeChatId={activeChatId}
+        collapsed={sidebarCollapsed}
+        onToggle={() => setSidebarCollapsed((current) => !current)}
+      />
+      <div
+        className={`flex min-h-screen flex-1 flex-col transition-[padding] duration-300 ${
+          sidebarCollapsed ? "lg:pl-20" : "lg:pl-56"
+        }`}
+      >
         <header className="sticky top-0 z-20 border-b border-slate-200/70 bg-white/80 backdrop-blur-xl">
           <div className="flex flex-col gap-4 px-6 py-5 md:flex-row md:items-center md:justify-between">
             <div className="space-y-2">

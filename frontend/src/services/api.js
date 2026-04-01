@@ -30,4 +30,24 @@ export function getErrorMessage(error) {
   return error?.message || "Something went wrong";
 }
 
+export function getFriendlyQueryError(error) {
+  const message = getErrorMessage(error);
+  const lowered = message.toLowerCase();
+
+  if (
+    lowered.includes("network error") ||
+    lowered.includes("timeout") ||
+    lowered.includes("connect") ||
+    lowered.includes("connection")
+  ) {
+    return "We couldn't reach the database just now. Please try again in a moment.";
+  }
+
+  if (lowered.includes("syntax") || lowered.includes("parse")) {
+    return "We couldn't run that query successfully. Please try rephrasing it.";
+  }
+
+  return "We couldn't find a result for that query. Please try rephrasing it.";
+}
+
 export default api;

@@ -69,6 +69,7 @@ class QueryResponse(BaseModel):
     """Response model for /query endpoint."""
 
     session_id: str = Field(..., description="Chat session ID")
+    title: Optional[str] = Field(None, description="Updated chat title")
     sql_query: str = Field(..., description="Generated SQL query")
     explanation: str = Field(..., description="Explanation of what the query does")
     results: List[Dict[str, Any]] = Field(

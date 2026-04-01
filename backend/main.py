@@ -4,6 +4,7 @@ Refactored to persist chat state and authenticate users with JWTs.
 """
 
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -220,7 +221,40 @@ def chat_title_from_request(request: ChatCreateRequest) -> str:
     """Choose a stable chat title when the client does not provide one."""
     if request.title and request.title.strip():
         return request.title.strip()
-    return f"{request.database.strip()} @ {request.host.strip()}"
+    return "New chat"
+
+
+def derive_chat_title_from_query(user_input: str) -> str:
+    """Build a short chat title from the first user question."""
+    cleaned = re.sub(r"\s+", " ", user_input).strip(" ?!.,")
+    words = cleaned.split()
+
+    if not words:
+        return "New chat"
+
+    title = " ".join(words[:4]).strip()
+    if len(words) > 4:
+        title = f"{title}..."
+
+    return title[:80]
+
+
+def to_user_friendly_query_error(raw_error: str | None) -> str:
+    """Translate low-level query failures into concise chat-safe messages."""
+    error_text = (raw_error or "").strip()
+    lowered = error_text.lower()
+
+    if not error_text:
+        return "We couldn't find a result for that query. Please try rephrasing it."
+    if "connect" in lowered or "timeout" in lowered or "connection" in lowered:
+        return "We couldn't reach the database just now. Please try again in a moment."
+    if "syntax" in lowered or "parse" in lowered:
+        return "We couldn't run that query successfully. Please try rephrasing it."
+    if "validation failed" in lowered or "safe select" in lowered:
+        return "We couldn't safely run that request. Please try asking it a different way."
+    if "no sql generated" in lowered or "could not generate sql" in lowered:
+        return "We couldn't generate a result for that question. Please try rephrasing it."
+    return "We couldn't find a result for that query. Please try rephrasing it."
 
 
 def normalize_kpi_items(raw_kpis) -> list[dict]:
@@ -674,6 +708,9 @@ async def generate_query(
         request.session_id,
         str(current_user["id"]),
     )
+    next_chat_title = chat["title"]
+    if not history:
+        next_chat_title = derive_chat_title_from_query(request.user_input)
 
     async with await get_target_database_service(chat) as target_db:
         schema = await target_db.get_compact_database_schema()
@@ -688,29 +725,32 @@ async def generate_query(
             logger.exception("LLM query generation failed")
             return QueryResponse(
                 session_id=request.session_id,
+                title=next_chat_title,
                 sql_query="",
                 explanation="The assistant could not generate a SQL query.",
                 results=[],
-                error=str(exc) or "Failed to generate SQL query",
+                error=to_user_friendly_query_error(str(exc) or "Failed to generate SQL query"),
             )
 
         if not sql_query:
             return QueryResponse(
                 session_id=request.session_id,
+                title=next_chat_title,
                 sql_query="",
                 explanation=explanation or "The assistant could not generate a SQL query.",
                 results=[],
-                error=explanation or "Could not generate SQL query",
+                error=to_user_friendly_query_error(explanation or "Could not generate SQL query"),
             )
 
         is_safe, error_msg = await target_db.is_safe_select_query(sql_query)
         if not is_safe:
             return QueryResponse(
                 session_id=request.session_id,
+                title=next_chat_title,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
-                error=f"Query validation failed: {error_msg}",
+                error=to_user_friendly_query_error(f"Query validation failed: {error_msg}"),
             )
 
         try:
@@ -719,10 +759,21 @@ async def generate_query(
             logger.error("Query execution failed: %s", e)
             return QueryResponse(
                 session_id=request.session_id,
+                title=next_chat_title,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
-                error=f"Query execution error: {str(e)}",
+                error=to_user_friendly_query_error(f"Query execution error: {str(e)}"),
+            )
+
+        if results is None:
+            return QueryResponse(
+                session_id=request.session_id,
+                title=next_chat_title,
+                sql_query=sql_query,
+                explanation=explanation or "",
+                results=[],
+                error=to_user_friendly_query_error("No results returned"),
             )
 
     await chats.append_query_message(
@@ -732,10 +783,13 @@ async def generate_query(
         explanation=explanation or "",
         results=results,
     )
+    if not history and next_chat_title != chat["title"]:
+        await chats.update_title(request.session_id, next_chat_title)
     await chats.update_last_referenced_table(request.session_id, sql_query)
 
     return QueryResponse(
         session_id=request.session_id,
+        title=next_chat_title,
         sql_query=sql_query,
         explanation=explanation or "",
         results=results,

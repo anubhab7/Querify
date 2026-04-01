@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { DatabaseZap, Layers3, LoaderCircle, RefreshCw } from "lucide-react";
+import { DatabaseZap, Layers3, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
@@ -7,9 +7,26 @@ import ChatComposer from "../components/ChatComposer";
 import QueryCard from "../components/QueryCard";
 import SuggestionChips from "../components/SuggestionChips";
 import { useToast } from "../hooks/useToast";
-import { getErrorMessage } from "../services/api";
+import { getErrorMessage, getFriendlyQueryError } from "../services/api";
 import { getChatHistory, getChatStatus, getSchema } from "../services/chats";
 import { getKpis, runQuery } from "../services/query";
+
+function buildChatTitleFromQuery(userInput) {
+  const words = userInput.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return "New chat";
+  const title = words.slice(0, 4).join(" ");
+  return words.length > 4 ? `${title}...` : title;
+}
+
+function persistChatTitle(chatId, title) {
+  if (!chatId || !title) return;
+  const savedTitles = JSON.parse(localStorage.getItem("querify_chat_titles") || "{}");
+  localStorage.setItem(
+    "querify_chat_titles",
+    JSON.stringify({ ...savedTitles, [chatId]: title }),
+  );
+  window.dispatchEvent(new Event("querify:chat-titles"));
+}
 
 export default function ChatPage() {
   const { chatId } = useParams();
@@ -27,15 +44,21 @@ export default function ChatPage() {
   const [submitting, setSubmitting] = useState(false);
   const bottomRef = useRef(null);
 
-  function normalizeMessages(nextMessages) {
-    if (!Array.isArray(nextMessages)) return [];
-    return nextMessages.map((message, index) => ({
+  function normalizeMessage(message, index = 0) {
+    return {
       ...message,
       id: message.id || message.created_at || `message-${index}`,
+      pending: Boolean(message.pending),
+      error: typeof message.error === "string" ? message.error : null,
       results: Array.isArray(message.results)
         ? message.results.filter((row) => row && typeof row === "object" && !Array.isArray(row))
         : [],
-    }));
+    };
+  }
+
+  function normalizeMessages(nextMessages) {
+    if (!Array.isArray(nextMessages)) return [];
+    return nextMessages.map((message, index) => normalizeMessage(message, index));
   }
   
   async function loadWorkspace({ silent = false } = {}) {
@@ -54,12 +77,7 @@ export default function ChatPage() {
       ]);
 
       setHistoryTitle(historyData.title);
-      const savedTitles = JSON.parse(localStorage.getItem("querify_chat_titles") || "{}");
-      localStorage.setItem(
-        "querify_chat_titles",
-        JSON.stringify({ ...savedTitles, [chatId]: historyData.title }),
-      );
-      window.dispatchEvent(new Event("querify:chat-titles"));
+      persistChatTitle(chatId, historyData.title);
       setMessages(normalizeMessages(historyData.messages));
       setKpis(Array.isArray(kpiData?.kpis) ? kpiData.kpis : []);
       setStatus(statusData);
@@ -98,7 +116,29 @@ export default function ChatPage() {
     const userInput = rawInput.trim();
     if (!userInput || submitting) return;
 
+    const optimisticId = crypto.randomUUID();
+    const isFirstMessage = messages.length === 0;
+    const optimisticTitle = isFirstMessage
+      ? buildChatTitleFromQuery(userInput)
+      : historyTitle;
+
     setPrompt("");
+    setMessages((current) => [
+      ...current,
+      normalizeMessage({
+        id: optimisticId,
+        user_input: userInput,
+        pending: true,
+        sql_query: "",
+        explanation: "",
+        results: [],
+        error: null,
+      }),
+    ]);
+    if (isFirstMessage) {
+      setHistoryTitle(optimisticTitle);
+      persistChatTitle(chatId, optimisticTitle);
+    }
     setSubmitting(true);
 
     try {
@@ -108,32 +148,38 @@ export default function ChatPage() {
         preferred_model: "gemini",
       });
 
-      setMessages((current) => [
-        ...current,
-        {
-          ...response,
-          user_input: userInput,
-          id: crypto.randomUUID(),
-          results: Array.isArray(response?.results)
-            ? response.results.filter((row) => row && typeof row === "object" && !Array.isArray(row))
-            : [],
-        },
-      ]);
-
-      if (response.error) {
-        showToast({
-          variant: "error",
-          title: "Query returned an issue",
-          description: response.error,
-        });
-      }
+      const resolvedTitle = response?.title || optimisticTitle;
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === optimisticId
+            ? normalizeMessage({
+                ...response,
+                id: optimisticId,
+                user_input: userInput,
+                pending: false,
+              })
+            : message,
+        ),
+      );
+      setHistoryTitle(resolvedTitle);
+      persistChatTitle(chatId, resolvedTitle);
     } catch (error) {
-      showToast({
-        variant: "error",
-        title: "Query failed",
-        description: getErrorMessage(error),
-      });
-      setPrompt(userInput);
+      const friendlyError = getFriendlyQueryError(error);
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === optimisticId
+            ? normalizeMessage({
+                id: optimisticId,
+                user_input: userInput,
+                pending: false,
+                sql_query: "",
+                explanation: friendlyError,
+                results: [],
+                error: friendlyError,
+              })
+            : message,
+        ),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -242,13 +288,6 @@ export default function ChatPage() {
               Ask a question or use a KPI suggestion to start the conversation.
             </div>
           )}
-
-          {submitting ? (
-            <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4 text-sm text-slate-600">
-              <LoaderCircle className="h-4 w-4 animate-spin text-indigo-600" />
-              Generating SQL and running your query...
-            </div>
-          ) : null}
 
           <div ref={bottomRef} />
         </div>
