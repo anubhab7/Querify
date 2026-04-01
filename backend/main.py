@@ -223,6 +223,62 @@ def chat_title_from_request(request: ChatCreateRequest) -> str:
     return f"{request.database.strip()} @ {request.host.strip()}"
 
 
+def normalize_kpi_items(raw_kpis) -> list[dict]:
+    """Coerce mixed KPI output into the response model's expected dictionary shape."""
+    def clean_label(value: str) -> str:
+        return value.replace("*", "").replace("`", "").replace("_", "").strip(" :.-").strip()
+
+    if not isinstance(raw_kpis, list):
+        return []
+
+    normalized: list[dict] = []
+    for index, item in enumerate(raw_kpis, start=1):
+        if isinstance(item, KPISuggestion):
+            normalized.append(item.model_dump())
+            continue
+
+        if not isinstance(item, dict):
+            continue
+
+        name = clean_label(
+            str(item.get("name") or item.get("title") or item.get("kpi") or "").strip()
+        )
+        description = clean_label(
+            str(
+            item.get("description")
+            or item.get("details")
+            or item.get("reason")
+            or item.get("value")
+            or ""
+            ).strip()
+        )
+
+        if name.lower() in {"kpi", "kpi name", "name"} and description:
+            name = description
+
+        if not name and description:
+            name = description[:80].strip()
+        if not description and name:
+            description = name
+        if not name:
+            continue
+
+        try:
+            number = int(item.get("number", index))
+        except (TypeError, ValueError):
+            number = index
+
+        normalized.append(
+            {
+                "number": number,
+                "name": name,
+                "description": description,
+            }
+        )
+
+    return normalized
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle management."""
@@ -521,6 +577,7 @@ async def get_chat_history(
                 user_input=message["user_input"],
                 sql_query=message["sql_query"],
                 explanation=message["explanation"],
+                results=message.get("results", []),
                 created_at=message["created_at"],
             )
             for message in history
@@ -620,20 +677,30 @@ async def generate_query(
 
     async with await get_target_database_service(chat) as target_db:
         schema = await target_db.get_compact_database_schema()
-        sql_query, explanation, _model_used = await llm.generate_sql_query(
-            user_input=resolved_input,
-            database_schema=schema,
-            chat_history=history,
-            preferred_model=request.preferred_model or "gemini",
-        )
+        try:
+            sql_query, explanation, _model_used = await llm.generate_sql_query(
+                user_input=resolved_input,
+                database_schema=schema,
+                chat_history=history,
+                preferred_model=request.preferred_model or "gemini",
+            )
+        except Exception as exc:
+            logger.exception("LLM query generation failed")
+            return QueryResponse(
+                session_id=request.session_id,
+                sql_query="",
+                explanation="The assistant could not generate a SQL query.",
+                results=[],
+                error=str(exc) or "Failed to generate SQL query",
+            )
 
         if not sql_query:
             return QueryResponse(
                 session_id=request.session_id,
                 sql_query="",
-                explanation=explanation or "Failed to generate query",
+                explanation=explanation or "The assistant could not generate a SQL query.",
                 results=[],
-                error="Could not generate SQL query",
+                error=explanation or "Could not generate SQL query",
             )
 
         is_safe, error_msg = await target_db.is_safe_select_query(sql_query)
@@ -663,6 +730,7 @@ async def generate_query(
         user_input=resolved_input,
         sql_query=sql_query,
         explanation=explanation or "",
+        results=results,
     )
     await chats.update_last_referenced_table(request.session_id, sql_query)
 
@@ -701,15 +769,24 @@ async def get_kpi_suggestions(
             "Could not retrieve database schema",
         )
 
-    kpis, explanation, _model_used = await llm.generate_kpi_suggestions(
-        database_schema=schema,
-        preferred_model="gemini",
-    )
-    if not kpis:
+    try:
+        kpis, explanation, _model_used = await llm.generate_kpi_suggestions(
+            database_schema=schema,
+            preferred_model="gemini",
+        )
+    except Exception as exc:
+        logger.exception("LLM KPI generation failed")
         raise_api_error(
-            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status.HTTP_502_BAD_GATEWAY,
             "KPI_GENERATION_FAILED",
-            "Failed to generate KPI suggestions",
+            str(exc) or "Failed to generate KPI suggestions",
+        )
+    normalized_kpis = normalize_kpi_items(kpis)
+    if not normalized_kpis:
+        raise_api_error(
+            status.HTTP_502_BAD_GATEWAY,
+            "KPI_GENERATION_FAILED",
+            explanation or "Failed to generate KPI suggestions",
         )
 
     return KPIResponse(
@@ -719,7 +796,7 @@ async def get_kpi_suggestions(
                 name=kpi.get("name", ""),
                 description=kpi.get("description", ""),
             )
-            for index, kpi in enumerate(kpis[:4])
+            for index, kpi in enumerate(normalized_kpis[:4])
         ],
         explanation=explanation or "KPI suggestions generated successfully",
     )

@@ -197,6 +197,7 @@ class PersistedMessageResponse(BaseModel):
     user_input: str
     sql_query: str
     explanation: str
+    results: Optional[List[Dict[str, Any]]] = Field(default_factory=list)
     created_at: datetime
 
 

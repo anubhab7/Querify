@@ -1,18 +1,30 @@
-"""
-LLM Service for orchestrating Gemini and Perplexity API calls.
-Handles message normalization, fallback logic, and context-aware query generation.
-"""
-
-import os
 import logging
+import json
+import os
 import re
-from typing import Optional, List, Dict, Tuple
-import google.generativeai as genai
-import aiohttp
 import asyncio
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
+import google.generativeai as genai
+
 from models.schema import ChatMessage, MessageRole
 
 logger = logging.getLogger(__name__)
+
+try:
+    from google.api_core.exceptions import GoogleAPIError
+except Exception:  # pragma: no cover - optional import guard
+    GoogleAPIError = Exception
+
+
+class LLMServiceError(Exception):
+    """Raised when an upstream LLM provider returns a usable failure reason."""
+
+    def __init__(self, provider: str, message: str):
+        self.provider = provider
+        self.message = message
+        super().__init__(message)
 
 
 class LLMService:
@@ -92,14 +104,28 @@ Brief explanation of what the query does
 
         # Try preferred model first, but skip Perplexity if it is unavailable or expired.
         model_used = preferred_model
-        result = await self._call_llm(preferred_model, messages)
+        try:
+            result = await self._call_llm(preferred_model, messages)
+        except LLMServiceError as exc:
+            logger.error("%s query generation failed: %s", exc.provider, exc.message)
+            return None, exc.message, model_used
+        except Exception as exc:
+            logger.exception("Unexpected SQL generation failure")
+            return None, self._extract_provider_error(exc), model_used
 
         if (result is None or result.strip() == "") and preferred_model != "gemini":
             logger.warning(
                 f"Preferred model {preferred_model} failed, attempting fallback gemini"
             )
             model_used = "gemini"
-            result = await self._call_llm("gemini", messages)
+            try:
+                result = await self._call_llm("gemini", messages)
+            except LLMServiceError as exc:
+                logger.error("%s query generation failed: %s", exc.provider, exc.message)
+                return None, exc.message, model_used
+            except Exception as exc:
+                logger.exception("Unexpected Gemini fallback failure")
+                return None, self._extract_provider_error(exc), model_used
 
         if result is None or result.strip() == "":
             logger.warning("LLM generation unavailable, using heuristic SQL fallback")
@@ -155,14 +181,28 @@ After the list, provide a brief explanation of how these KPIs work together."""
 
         # Try preferred model first, but skip Perplexity if it is unavailable or expired.
         model_used = preferred_model
-        result = await self._call_llm(preferred_model, messages)
+        try:
+            result = await self._call_llm(preferred_model, messages)
+        except LLMServiceError as exc:
+            logger.error("%s KPI generation failed: %s", exc.provider, exc.message)
+            return None, exc.message, model_used
+        except Exception as exc:
+            logger.exception("Unexpected KPI generation failure")
+            return None, self._extract_provider_error(exc), model_used
 
         if (result is None or result.strip() == "") and preferred_model != "gemini":
             logger.warning(
                 f"Preferred model {preferred_model} failed, attempting fallback gemini"
             )
             model_used = "gemini"
-            result = await self._call_llm("gemini", messages)
+            try:
+                result = await self._call_llm("gemini", messages)
+            except LLMServiceError as exc:
+                logger.error("%s KPI generation failed: %s", exc.provider, exc.message)
+                return None, exc.message, model_used
+            except Exception as exc:
+                logger.exception("Unexpected Gemini KPI fallback failure")
+                return None, self._extract_provider_error(exc), model_used
 
         if result is None or result.strip() == "":
             logger.warning("LLM KPI generation unavailable, using heuristic KPI fallback")
@@ -186,16 +226,12 @@ After the list, provide a brief explanation of how these KPIs work together."""
         Returns:
             LLM response or None if failed
         """
-        try:
-            if model == "gemini":
-                return await self._call_gemini(messages)
-            elif model == "perplexity":
-                return await self._call_perplexity(messages)
-            else:
-                logger.error(f"Unknown model: {model}")
-                return None
-        except Exception as e:
-            logger.error(f"Error calling {model}: {e}")
+        if model == "gemini":
+            return await self._call_gemini(messages)
+        elif model == "perplexity":
+            return await self._call_perplexity(messages)
+        else:
+            logger.error(f"Unknown model: {model}")
             return None
 
     async def _call_gemini(self, messages: List[Dict]) -> Optional[str]:
@@ -209,8 +245,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
             Response text or None
         """
         if not self.gemini_api_key:
-            logger.error("Gemini API key not configured")
-            return None
+            raise LLMServiceError("gemini", "Gemini API key not configured")
 
         try:
             prompt_parts = []
@@ -227,11 +262,16 @@ After the list, provide a brief explanation of how these KPIs work together."""
             if response and response.text:
                 return response.text.strip()
 
-            return None
+            raise LLMServiceError(
+                "gemini", "Gemini returned an empty response for this request."
+            )
 
-        except Exception as e:
-            logger.error(f"Gemini API error: {e}")
-            return None
+        except LLMServiceError:
+            raise
+        except GoogleAPIError as exc:
+            raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
+        except Exception as exc:
+            raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
 
     async def _call_perplexity(self, messages: List[Dict]) -> Optional[str]:
         """
@@ -244,8 +284,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
             Response text or None
         """
         if not self.perplexity_api_key:
-            logger.error("Perplexity API key not configured")
-            return None
+            raise LLMServiceError("perplexity", "Perplexity API key not configured")
 
         try:
             # Normalize messages for Perplexity
@@ -279,17 +318,70 @@ After the list, provide a brief explanation of how these KPIs work together."""
                                 .strip()
                             )
                     else:
-                        logger.error(f"Perplexity API error: {response.status}")
-                        return None
+                        error_payload = await response.text()
+                        raise LLMServiceError(
+                            "perplexity",
+                            self._extract_provider_error(
+                                Exception(
+                                    f"Perplexity API error {response.status}: {error_payload}"
+                                )
+                            ),
+                        )
 
         except asyncio.TimeoutError:
-            logger.error("Perplexity API request timeout")
-            return None
-        except Exception as e:
-            logger.error(f"Perplexity API error: {e}")
-            return None
+            raise LLMServiceError(
+                "perplexity", "Perplexity API request timed out."
+            ) from None
+        except LLMServiceError:
+            raise
+        except Exception as exc:
+            raise LLMServiceError(
+                "perplexity", self._extract_provider_error(exc)
+            ) from exc
 
         return None
+
+    @staticmethod
+    def _extract_provider_error(exc: Exception) -> str:
+        """Best-effort extraction of a concise upstream provider failure reason."""
+        candidates: List[str] = []
+
+        for value in (
+            getattr(exc, "message", None),
+            getattr(exc, "details", None),
+            str(exc),
+        ):
+            if isinstance(value, str) and value.strip():
+                candidates.append(value.strip())
+
+        response = getattr(exc, "response", None)
+        if response is not None:
+            response_text = getattr(response, "text", None)
+            if isinstance(response_text, str) and response_text.strip():
+                candidates.append(response_text.strip())
+
+        for candidate in candidates:
+            message_match = re.search(
+                r'"message"\s*:\s*"([^"]+)"',
+                candidate,
+                flags=re.IGNORECASE,
+            )
+            if message_match:
+                return message_match.group(1).strip()
+
+            details_match = re.search(
+                r"details\s*=\s*['\"]([^'\"]+)['\"]",
+                candidate,
+                flags=re.IGNORECASE,
+            )
+            if details_match:
+                return details_match.group(1).strip()
+
+            cleaned = re.sub(r"\s+", " ", candidate).strip(" :")
+            if cleaned:
+                return cleaned
+
+        return "The LLM provider request failed."
 
     @staticmethod
     def _parse_schema(database_schema: str) -> List[Dict[str, object]]:
@@ -569,55 +661,160 @@ After the list, provide a brief explanation of how these KPIs work together."""
             return None
 
     @staticmethod
-    def _parse_kpi_suggestions(response: str) -> Optional[List[Dict]]:
+    def _parse_kpi_suggestions(response: str) -> Optional[List[Dict[str, Any]]]:
         """
-        Parse KPI suggestions from numbered list format.
+        Parse KPI suggestions from JSON or numbered list format.
 
-        Expected format:
-        1. KPI Name: Description
-        2. KPI Name: Description
-        ...
+        Accepted examples:
+        - [{"number": 1, "name": "...", "description": "..."}]
+        - {"kpis": [...]}
+        - 1. KPI Name: Description
         """
         try:
-            lines = response.split("\n")
-            kpis = []
+            json_payload = LLMService._extract_json_payload(response)
+            if json_payload is not None:
+                if isinstance(json_payload, dict):
+                    candidate_items = json_payload.get("kpis")
+                else:
+                    candidate_items = json_payload
+
+                if isinstance(candidate_items, list):
+                    parsed_from_json = []
+                    for index, item in enumerate(candidate_items, start=1):
+                        normalized_item = LLMService._coerce_kpi_item(item, index=index)
+                        if normalized_item is not None:
+                            parsed_from_json.append(normalized_item)
+                    if parsed_from_json:
+                        return parsed_from_json
+
+            lines = response.splitlines()
+            numbered_kpis: List[Dict[str, Any]] = []
 
             for line in lines:
-                line = line.strip()
-                # Match numbered lines (1., 2., etc.)
-                if line and line[0].isdigit() and "." in line:
-                    # Extract number
-                    number_str = line.split(".")[0].strip()
-                    if not number_str.isdigit():
-                        continue
+                stripped = line.strip().strip("*").strip()
+                if not stripped:
+                    continue
 
-                    number = int(number_str)
+                match = re.match(
+                    r"^(?P<number>\d+)[\.\)]\s*(?P<body>.+)$",
+                    stripped,
+                )
+                if not match:
+                    continue
 
-                    # Extract rest of line
-                    rest = ".".join(line.split(".")[1:]).strip()
+                number = int(match.group("number"))
+                body = match.group("body").strip()
 
-                    # Try to split on colon
-                    if ":" in rest:
-                        name, description = rest.split(":", 1)
-                        name = name.strip()
-                        description = description.strip()
-                    else:
-                        name = rest[:50]  # Take first 50 chars as name
-                        description = rest
+                if ":" in body:
+                    name, description = body.split(":", 1)
+                elif " - " in body:
+                    name, description = body.split(" - ", 1)
+                else:
+                    name, description = body, body
 
-                    kpis.append(
-                        {
-                            "number": number,
-                            "name": name,
-                            "description": description,
-                        }
-                    )
+                normalized_item = LLMService._coerce_kpi_item(
+                    {
+                        "number": number,
+                        "name": name.strip(),
+                        "description": description.strip(),
+                    },
+                    index=number,
+                )
+                if normalized_item is not None:
+                    numbered_kpis.append(normalized_item)
 
-            return kpis if kpis else None
+            return numbered_kpis if numbered_kpis else None
 
         except Exception as e:
             logger.error(f"Error parsing KPI suggestions: {e}")
             return None
+
+    @staticmethod
+    def _extract_json_payload(response: str) -> Optional[Any]:
+        """Extract a JSON object or array from a raw LLM response."""
+        candidates = [response.strip()]
+
+        fenced_match = re.search(r"```(?:json)?\s*(.*?)```", response, flags=re.DOTALL)
+        if fenced_match:
+            candidates.insert(0, fenced_match.group(1).strip())
+
+        bracket_match = re.search(r"(\[\s*{.*}\s*]|\{\s*\".*\})", response, flags=re.DOTALL)
+        if bracket_match:
+            candidates.append(bracket_match.group(1).strip())
+
+        for candidate in candidates:
+            if not candidate:
+                continue
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+
+        return None
+
+    @staticmethod
+    def _coerce_kpi_item(item: Any, index: int) -> Optional[Dict[str, Any]]:
+        """Normalize one KPI item into the API's expected dictionary shape."""
+        def clean_label(value: str) -> str:
+            return re.sub(r"[*_`]+", "", value).strip(" :.-").strip()
+
+        if isinstance(item, str):
+            stripped = item.strip()
+            if not stripped:
+                return None
+            if ":" in stripped:
+                name, description = stripped.split(":", 1)
+            elif " - " in stripped:
+                name, description = stripped.split(" - ", 1)
+            else:
+                name, description = stripped, stripped
+            cleaned_name = clean_label(name)
+            cleaned_description = clean_label(description)
+            if cleaned_name.lower() in {"kpi", "kpi name", "name"} and cleaned_description:
+                cleaned_name = cleaned_description
+            return {
+                "number": index,
+                "name": cleaned_name,
+                "description": cleaned_description or cleaned_name,
+            }
+
+        if not isinstance(item, dict):
+            return None
+
+        name = clean_label(
+            str(item.get("name") or item.get("title") or item.get("kpi") or "").strip()
+        )
+        description = clean_label(
+            str(
+            item.get("description")
+            or item.get("details")
+            or item.get("reason")
+            or item.get("value")
+            or ""
+            ).strip()
+        )
+
+        if name.lower() in {"kpi", "kpi name", "name"} and description:
+            name = description
+
+        if not name and description:
+            name = description[:80].strip()
+        if not description and name:
+            description = name
+        if not name:
+            return None
+
+        raw_number = item.get("number", index)
+        try:
+            number = int(raw_number)
+        except (TypeError, ValueError):
+            number = index
+
+        return {
+            "number": number,
+            "name": name,
+            "description": description,
+        }
 
     @staticmethod
     def _extract_kpi_explanation(response: str) -> Optional[str]:

@@ -22,13 +22,29 @@ export default function ChatPage() {
   const [kpis, setKpis] = useState([]);
   const [kpiLoading, setKpiLoading] = useState(true);
   const [historyLoading, setHistoryLoading] = useState(true);
+  const [workspaceRefreshing, setWorkspaceRefreshing] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const bottomRef = useRef(null);
+
+  function normalizeMessages(nextMessages) {
+    if (!Array.isArray(nextMessages)) return [];
+    return nextMessages.map((message, index) => ({
+      ...message,
+      id: message.id || message.created_at || `message-${index}`,
+      results: Array.isArray(message.results)
+        ? message.results.filter((row) => row && typeof row === "object" && !Array.isArray(row))
+        : [],
+    }));
+  }
   
-  async function loadWorkspace() {
+  async function loadWorkspace({ silent = false } = {}) {
     try {
-      setHistoryLoading(true);
+      if (silent) {
+        setWorkspaceRefreshing(true);
+      } else {
+        setHistoryLoading(true);
+      }
       setKpiLoading(true);
 
       const [historyData, kpiData, statusData] = await Promise.all([
@@ -44,8 +60,8 @@ export default function ChatPage() {
         JSON.stringify({ ...savedTitles, [chatId]: historyData.title }),
       );
       window.dispatchEvent(new Event("querify:chat-titles"));
-      setMessages(historyData.messages);
-      setKpis(kpiData.kpis);
+      setMessages(normalizeMessages(historyData.messages));
+      setKpis(Array.isArray(kpiData?.kpis) ? kpiData.kpis : []);
       setStatus(statusData);
     } catch (error) {
       showToast({
@@ -56,6 +72,7 @@ export default function ChatPage() {
     } finally {
       setHistoryLoading(false);
       setKpiLoading(false);
+      setWorkspaceRefreshing(false);
     }
   }
 
@@ -97,6 +114,9 @@ export default function ChatPage() {
           ...response,
           user_input: userInput,
           id: crypto.randomUUID(),
+          results: Array.isArray(response?.results)
+            ? response.results.filter((row) => row && typeof row === "object" && !Array.isArray(row))
+            : [],
         },
       ]);
 
@@ -183,11 +203,12 @@ export default function ChatPage() {
             </button>
             <button
               type="button"
-              onClick={loadWorkspace}
+              onClick={() => loadWorkspace({ silent: true })}
+              disabled={workspaceRefreshing}
               className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-indigo-300 hover:text-indigo-700"
             >
-              <RefreshCw className="h-4 w-4" />
-              Refresh
+              <RefreshCw className={`h-4 w-4 ${workspaceRefreshing ? "animate-spin" : ""}`} />
+              {workspaceRefreshing ? "Refreshing" : "Refresh"}
             </button>
           </div>
         </div>

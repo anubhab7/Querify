@@ -3,10 +3,11 @@ Persistent chat session management backed by the app database.
 Handles chat storage, message history, and pronoun resolution.
 """
 
+import json
 import logging
 import re
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from models.schema import ChatMessage, MessageRole
 from services.database_service import DatabaseService
@@ -110,6 +111,7 @@ class ChatSessionManager:
                 m.user_input,
                 m.sql_query,
                 m.explanation,
+                m.results,
                 COALESCE(m.created_at, m.timestamp) AS created_at
             FROM messages m
             INNER JOIN chats c ON c.id = m.chat_id
@@ -119,7 +121,14 @@ class ChatSessionManager:
             chat_id,
             user_id,
         )
-        return [dict(row) for row in rows]
+        history: List[Dict[str, Any]] = []
+        for row in rows:
+            message = dict(row)
+            message["results"] = self._normalize_results_payload(message.get("results"))
+
+            history.append(message)
+
+        return history
 
     async def get_recent_messages_for_llm(
         self, chat_id: str, user_id: str
@@ -157,16 +166,19 @@ class ChatSessionManager:
         user_input: str,
         sql_query: str,
         explanation: str,
+        results: List[Dict[str, Any]],
     ) -> Dict:
         """Persist a query interaction for a chat."""
         message_id = str(uuid.uuid4())
+        normalized_results = self._normalize_results_payload(results)
+        serialized_results = json.dumps(normalized_results, default=str)
         row = await self.app_db.fetchrow(
             """
             INSERT INTO messages (
-                id, chat_id, role, content, user_input, sql_query, explanation, timestamp, created_at
+                id, chat_id, role, content, user_input, sql_query, explanation, results, timestamp, created_at
             )
-            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, NOW(), NOW())
-            RETURNING id, chat_id, user_input, sql_query, explanation, created_at;
+            VALUES ($1, $2::uuid, $3, $4, $5, $6, $7, $8::jsonb, NOW(), NOW())
+            RETURNING id, chat_id, user_input, sql_query, explanation, results, created_at;
             """,
             message_id,
             chat_id,
@@ -175,10 +187,13 @@ class ChatSessionManager:
             user_input,
             sql_query,
             explanation,
+            serialized_results,
         )
         await self.touch_chat(chat_id)
         assert row is not None
-        return dict(row)
+        message = dict(row)
+        message["results"] = self._normalize_results_payload(message.get("results"))
+        return message
 
     async def touch_chat(self, chat_id: str) -> None:
         """Refresh the chat update timestamp."""
@@ -291,3 +306,41 @@ class ChatSessionManager:
         except Exception as e:
             logger.error("Error extracting table from query: %s", e)
             return None
+
+    @staticmethod
+    def _normalize_results_payload(raw_results: Any) -> List[Dict[str, Any]]:
+        """Normalize JSON/JSONB payloads into a safe list-of-dicts shape."""
+        if raw_results is None or raw_results == "":
+            return []
+
+        if isinstance(raw_results, bytes):
+            try:
+                raw_results = raw_results.decode("utf-8")
+            except UnicodeDecodeError:
+                logger.warning("Failed to decode message results bytes payload")
+                return []
+
+        if isinstance(raw_results, str):
+            stripped = raw_results.strip()
+            if not stripped:
+                return []
+            try:
+                raw_results = json.loads(stripped)
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse message results JSON")
+                return []
+
+        if isinstance(raw_results, dict):
+            return [raw_results]
+
+        if not isinstance(raw_results, list):
+            return []
+
+        normalized_results: List[Dict[str, Any]] = []
+        for row in raw_results:
+            if isinstance(row, dict):
+                normalized_results.append(row)
+            else:
+                logger.warning("Skipping non-dictionary message result row: %r", row)
+
+        return normalized_results

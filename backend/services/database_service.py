@@ -313,11 +313,38 @@ class DatabaseService:
             )
             await connection.execute(
                 """
+                ALTER TABLE messages ADD COLUMN IF NOT EXISTS results JSONB;
+                """
+            )
+            await connection.execute(
+                """
                 UPDATE messages
                 SET
                     user_input = COALESCE(user_input, content),
                     created_at = COALESCE(created_at, timestamp, NOW())
                 WHERE user_input IS NULL OR created_at IS NULL;
+                """
+            )
+            await connection.execute(
+                """
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_name = 'messages'
+                          AND column_name = 'results'
+                          AND data_type <> 'jsonb'
+                    ) THEN
+                        ALTER TABLE messages
+                        ALTER COLUMN results TYPE JSONB
+                        USING CASE
+                            WHEN results IS NULL OR BTRIM(results) = '' THEN '[]'::jsonb
+                            ELSE results::jsonb
+                        END;
+                    END IF;
+                END
+                $$;
                 """
             )
             await connection.execute(
