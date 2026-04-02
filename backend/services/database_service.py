@@ -275,7 +275,7 @@ class DatabaseService:
                     db_username = COALESCE(db_username, target_db_user),
                     db_password = COALESCE(db_password, target_db_password),
                     db_ssl = COALESCE(db_ssl, target_db_ssl, true),
-                    updated_at = COALESCE(updated_at, last_activity, created_at, NOW())
+                    updated_at = COALESCE(updated_at, created_at, NOW())
                 WHERE
                     db_host IS NULL
                     OR db_port IS NULL
