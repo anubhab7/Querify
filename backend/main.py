@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from models.schema import (
@@ -63,7 +63,10 @@ class Settings(BaseSettings):
     gemini_api_key: Optional[str] = None
     perplexity_api_key: Optional[str] = None
     api_host: str = "0.0.0.0"
-    api_port: int = 8000
+    api_port: int = Field(
+        default=8000,
+        validation_alias=AliasChoices("PORT", "api_port"),
+    )
     api_debug: bool = False
     cors_origins: list[str] = [
         "http://localhost:3000",
