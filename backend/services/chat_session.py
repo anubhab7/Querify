@@ -91,7 +91,7 @@ class ChatSessionManager:
                 id,
                 title,
                 created_at,
-                COALESCE(updated_at, last_activity, created_at) AS updated_at,
+                COALESCE(updated_at, created_at) AS updated_at,
                 last_referenced_table
             FROM chats
             WHERE user_id = $1::uuid
