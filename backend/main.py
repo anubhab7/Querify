@@ -60,7 +60,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql://user:password@localhost:5432/querify_db"
     app_database_url: Optional[str] = None
-    gemini_api_key: Optional[str] = None
+    gemini_api_keys: Optional[str] = None
     perplexity_api_key: Optional[str] = None
     api_host: str = "0.0.0.0"
     api_port: int = Field(
@@ -333,7 +333,7 @@ async def lifespan(app: FastAPI):
         logger.info("App database connection pool initialized")
 
         llm_service = LLMService(
-            gemini_api_key=settings.gemini_api_key,
+            gemini_api_keys=settings.gemini_api_keys,
             perplexity_api_key=settings.perplexity_api_key,
         )
         logger.info("LLM service initialized")
