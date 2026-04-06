@@ -85,7 +85,7 @@ cp .env.example .env
 
 Edit `.env` with:
 - `DATABASE_URL` - PostgreSQL connection string
-- `GEMINI_API_KEY` - Your Gemini API key
+- `GEMINI_API_KEYS` - Comma-separated Gemini API keys (rotation enabled)
 - `PERPLEXITY_API_KEY` - Your Perplexity API key
 - `CORS_ORIGINS` - Frontend URL(s)
 
@@ -186,7 +186,7 @@ The service automatically normalizes messages for Perplexity API to ensure:
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | DATABASE_URL | Yes | - | PostgreSQL connection string |
-| GEMINI_API_KEY | Yes | - | Google Gemini API key |
+| GEMINI_API_KEYS | Yes | - | Comma-separated Google Gemini API keys used with automatic rotation |
 | PERPLEXITY_API_KEY | Yes | - | Perplexity API key |
 | API_HOST | No | 0.0.0.0 | Server host |
 | API_PORT | No | 8000 | Server port |
@@ -248,7 +248,8 @@ Common `/database/connect` error codes:
 - Check network connectivity
 
 ### API Key Errors
-- Verify `GEMINI_API_KEY` and `PERPLEXITY_API_KEY` are valid
+- Verify `GEMINI_API_KEYS` and `PERPLEXITY_API_KEY` are valid
+- For Gemini, provide multiple keys as comma-separated values (for example: `GEMINI_API_KEYS=key1,key2,key3`)
 - Check API key permissions/quotas
 - Ensure keys are properly set in `.env`
 

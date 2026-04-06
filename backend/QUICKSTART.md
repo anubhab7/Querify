@@ -30,7 +30,7 @@ nano .env  # or use your preferred editor
 **Required values**:
 ```
 DATABASE_URL=postgresql://user:password@localhost:5432/querify_db
-GEMINI_API_KEY=your_api_key_here
+GEMINI_API_KEYS=key1,key2,key3
 PERPLEXITY_API_KEY=your_api_key_here
 ```
 
@@ -105,6 +105,7 @@ curl -X POST http://localhost:8000/kpis
 
 ### "API key error"
 - Verify keys in `.env` are correct
+- For Gemini, set `GEMINI_API_KEYS` as a comma-separated list to enable automatic key rotation
 - Check Gemini/Perplexity quotas in console
 - Ensure no extra whitespace in keys
 
