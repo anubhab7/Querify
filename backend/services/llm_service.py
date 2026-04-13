@@ -3,7 +3,6 @@ import json
 import os
 import re
 import asyncio
-import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -14,11 +13,9 @@ from models.schema import ChatMessage, MessageRole
 logger = logging.getLogger(__name__)
 
 try:
-    from google.api_core.exceptions import GoogleAPIError, ResourceExhausted, TooManyRequests
+    from google.api_core.exceptions import GoogleAPIError
 except Exception:  # pragma: no cover - optional import guard
     GoogleAPIError = Exception
-    ResourceExhausted = Exception
-    TooManyRequests = Exception
 
 
 class LLMServiceError(Exception):
@@ -33,12 +30,8 @@ class LLMServiceError(Exception):
 class LLMService:
     """Service for LLM operations with Gemini and Perplexity support."""
 
-    _gemini_key_index: int = 0
-    _gemini_key_lock = threading.Lock()
-
     def __init__(
         self,
-        gemini_api_keys: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
         perplexity_api_key: Optional[str] = None,
     ):
@@ -46,25 +39,14 @@ class LLMService:
         Initialize LLM service with API keys.
 
         Args:
-            gemini_api_keys: Comma-separated Gemini API keys
-            gemini_api_key: Legacy single Gemini API key (fallback)
+            gemini_api_key: Gemini API key (from environment if not provided)
             perplexity_api_key: Perplexity API key (from environment if not provided)
         """
-        raw_keys = gemini_api_keys or os.getenv("GEMINI_API_KEYS", "")
-        if not raw_keys:
-            legacy_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
-            raw_keys = legacy_key
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
+        self.perplexity_api_key = perplexity_api_key or os.getenv("PERPLEXITY_API_KEY")
 
-        self.gemini_api_keys = [
-            key.strip() for key in raw_keys.split(",") if key and key.strip()
-        ]
-        self.gemini_api_key = self.gemini_api_keys[0] if self.gemini_api_keys else None
-        self.perplexity_api_key = perplexity_api_key or os.getenv(
-            "PERPLEXITY_API_KEY"
-        )
-
-        if self.gemini_api_keys:
-            self._configure_gemini_client(self._current_gemini_key())
+        if self.gemini_api_key:
+            genai.configure(api_key=self.gemini_api_key)
 
         self.gemini_model = "gemini-2.5-flash"
         self.perplexity_model = "sonar-pro"
@@ -260,78 +242,34 @@ After the list, provide a brief explanation of how these KPIs work together."""
         Returns:
             Response text or None
         """
-        if not self.gemini_api_keys:
+        if not self.gemini_api_key:
             raise LLMServiceError("gemini", "Gemini API key not configured")
 
-        prompt_parts = []
-        for msg in messages:
-            role = msg.get("role", "user").upper()
-            prompt_parts.append(f"{role}:\n{msg.get('content', '')}")
+        try:
+            prompt_parts = []
+            for msg in messages:
+                role = msg.get("role", "user").upper()
+                prompt_parts.append(f"{role}:\n{msg.get('content', '')}")
 
-        max_attempts = len(self.gemini_api_keys)
-        last_exception: Optional[Exception] = None
-
-        for attempt in range(max_attempts):
-            active_index = self._current_gemini_key_index()
-            active_key = self._current_gemini_key()
-            self._configure_gemini_client(active_key)
-
-            try:
-                model = genai.GenerativeModel(self.gemini_model)
-                response = model.generate_content(
-                    "\n\n".join(prompt_parts),
-                    stream=False,
-                )
-
-                if response and response.text:
-                    return response.text.strip()
-
-                raise LLMServiceError(
-                    "gemini", "Gemini returned an empty response for this request."
-                )
-
-            except LLMServiceError:
-                raise
-            except GoogleAPIError as exc:
-                if self._is_gemini_quota_error(exc) and attempt < max_attempts - 1:
-                    last_exception = exc
-                    next_index = self._rotate_gemini_key_index()
-                    logger.warning(
-                        "Gemini key at index %s exhausted/rate-limited; rotating to index %s",
-                        active_index,
-                        next_index,
-                    )
-                    continue
-                if self._is_gemini_quota_error(exc):
-                    last_exception = exc
-                    break
-                raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
-            except Exception as exc:
-                if self._is_gemini_quota_error(exc) and attempt < max_attempts - 1:
-                    last_exception = exc
-                    next_index = self._rotate_gemini_key_index()
-                    logger.warning(
-                        "Gemini key at index %s exhausted/rate-limited; rotating to index %s",
-                        active_index,
-                        next_index,
-                    )
-                    continue
-                if self._is_gemini_quota_error(exc):
-                    last_exception = exc
-                    break
-                raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
-
-        if last_exception is not None:
-            logger.warning(
-                "All configured Gemini API keys exhausted or rate-limited. Last provider error: %s",
-                self._extract_provider_error(last_exception),
+            model = genai.GenerativeModel(self.gemini_model)
+            response = model.generate_content(
+                "\n\n".join(prompt_parts),
+                stream=False,
             )
-            raise LLMServiceError(
-                "gemini",
-                "Daily limit reached for all configured Gemini API keys. Please try again later.",
-            ) from last_exception
 
-        raise LLMServiceError("gemini", "Gemini request failed unexpectedly.")
+            if response and response.text:
+                return response.text.strip()
+
+            raise LLMServiceError(
+                "gemini", "Gemini returned an empty response for this request."
+            )
+
+        except LLMServiceError:
+            raise
+        except GoogleAPIError as exc:
+            raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
+        except Exception as exc:
+            raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
 
     async def _call_perplexity(self, messages: List[Dict]) -> Optional[str]:
         """
@@ -442,41 +380,6 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 return cleaned
 
         return "The LLM provider request failed."
-
-    @classmethod
-    def _current_gemini_key_index(cls) -> int:
-        with cls._gemini_key_lock:
-            return cls._gemini_key_index
-
-    def _current_gemini_key(self) -> str:
-        index = self._current_gemini_key_index()
-        return self.gemini_api_keys[index % len(self.gemini_api_keys)]
-
-    @classmethod
-    def _rotate_gemini_key_index(cls) -> int:
-        with cls._gemini_key_lock:
-            cls._gemini_key_index += 1
-            return cls._gemini_key_index
-
-    @staticmethod
-    def _configure_gemini_client(api_key: str) -> None:
-        genai.configure(api_key=api_key)
-
-    @staticmethod
-    def _is_gemini_quota_error(exc: Exception) -> bool:
-        if isinstance(exc, (ResourceExhausted, TooManyRequests)):
-            return True
-
-        lowered = str(exc).lower()
-        quota_markers = (
-            "429",
-            "resourceexhausted",
-            "resource exhausted",
-            "quota",
-            "rate limit",
-            "too many requests",
-        )
-        return any(marker in lowered for marker in quota_markers)
 
     @staticmethod
     def _parse_schema(database_schema: str) -> List[Dict[str, object]]:
