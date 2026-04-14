@@ -1,25 +1,35 @@
 import { motion } from "framer-motion";
 import { Sparkles } from "lucide-react";
 
-export default function SuggestionChips({ items, onSelect, loading }) {
+export default function SuggestionChips({ items, onSelect, loading, error }) {
   if (loading) {
     return (
-      <div className="rounded-3xl border border-slate-200 bg-white/80 p-5 shadow-soft">
+      <div className="rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-soft">
         <div className="mb-4 flex items-center gap-2 text-sm font-semibold text-slate-700">
           <Sparkles className="h-4 w-4 text-emerald-500" />
           KPI Suggestions
         </div>
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          {Array.from({ length: 4 }).map((_, index) => (
-            <div key={index} className="rounded-2xl border border-slate-200 bg-slate-50/80 p-4">
-              <div className="mb-3 flex items-center gap-2">
-                <div className="h-2.5 w-2.5 animate-pulse rounded-full bg-emerald-400" />
-                <div className="h-4 w-24 animate-pulse rounded bg-slate-200" />
-              </div>
-              <div className="h-4 w-3/4 animate-pulse rounded bg-slate-200" />
-              <div className="mt-2 h-4 w-full animate-pulse rounded bg-slate-100" />
-            </div>
-          ))}
+        <div className="flex min-h-[176px] flex-col items-center justify-center rounded-3xl border border-dashed border-slate-200 bg-slate-50/80 px-5 py-10 text-center">
+          <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-emerald-500" />
+          <p className="mt-4 text-base font-semibold text-slate-900">Loading KPIs</p>
+          <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
+            Gemini is analyzing the connected schema and preparing suggested KPI prompts.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="rounded-3xl border border-amber-200 bg-amber-50/70 p-5 shadow-soft">
+        <div className="mb-3 flex items-center gap-2 text-sm font-semibold text-amber-900">
+          <Sparkles className="h-4 w-4 text-amber-600" />
+          KPI Suggestions
+        </div>
+        <div className="rounded-2xl border border-amber-200 bg-white/70 p-4 text-sm text-amber-950">
+          <p className="font-semibold">KPI suggestions could not be loaded.</p>
+          <p className="mt-2 leading-6 text-amber-900/80">{error}</p>
         </div>
       </div>
     );

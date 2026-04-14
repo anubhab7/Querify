@@ -13,9 +13,27 @@ from models.schema import ChatMessage, MessageRole
 logger = logging.getLogger(__name__)
 
 try:
-    from google.api_core.exceptions import GoogleAPIError
+    from google.api_core.exceptions import (
+        BadRequest,
+        DeadlineExceeded,
+        GoogleAPIError,
+        InternalServerError,
+        PermissionDenied,
+        ResourceExhausted,
+        ServiceUnavailable,
+        TooManyRequests,
+        Unauthenticated,
+    )
 except Exception:  # pragma: no cover - optional import guard
     GoogleAPIError = Exception
+    BadRequest = Exception
+    DeadlineExceeded = Exception
+    InternalServerError = Exception
+    PermissionDenied = Exception
+    ResourceExhausted = Exception
+    ServiceUnavailable = Exception
+    TooManyRequests = Exception
+    Unauthenticated = Exception
 
 
 class LLMServiceError(Exception):
@@ -126,12 +144,12 @@ Brief explanation of what the query does
                 return None, self._extract_provider_error(exc), model_used
 
         if result is None or result.strip() == "":
-            logger.warning("LLM generation unavailable, using heuristic SQL fallback")
-            sql_query, explanation = self._generate_query_heuristically(
-                user_input=user_input,
-                database_schema=database_schema,
+            logger.warning("LLM generation unavailable and no SQL response was returned")
+            return (
+                None,
+                "The LLM provider did not return a SQL query for this request.",
+                model_used,
             )
-            return sql_query, explanation, "heuristic"
 
         # Parse response
         sql_query = self._extract_sql(result)
@@ -203,13 +221,24 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 return None, self._extract_provider_error(exc), model_used
 
         if result is None or result.strip() == "":
-            logger.warning("LLM KPI generation unavailable, using heuristic KPI fallback")
-            kpis, explanation = self._generate_kpis_heuristically(database_schema)
-            return kpis, explanation, "heuristic"
+            logger.warning("LLM KPI generation unavailable and no KPI response was returned")
+            return (
+                None,
+                "The LLM provider did not return KPI suggestions for this database.",
+                model_used,
+            )
 
         # Parse KPIs and explanation
         kpis = self._parse_kpi_suggestions(result)
         explanation = self._extract_kpi_explanation(result)
+
+        if not kpis:
+            return (
+                None,
+                explanation
+                or "The LLM provider did not return valid KPI suggestions for this database.",
+                model_used,
+            )
 
         return kpis, explanation, model_used
 
@@ -266,10 +295,113 @@ After the list, provide a brief explanation of how these KPIs work together."""
 
         except LLMServiceError:
             raise
+        except (ResourceExhausted, TooManyRequests) as exc:
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(
+                    exc,
+                    default="Gemini API usage limit reached. Please try again shortly.",
+                ),
+            ) from exc
+        except (Unauthenticated, PermissionDenied) as exc:
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(
+                    exc,
+                    default="Gemini API authentication failed. Please verify the configured API key and permissions.",
+                ),
+            ) from exc
+        except (DeadlineExceeded, asyncio.TimeoutError) as exc:
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(
+                    exc,
+                    default="Gemini API request timed out. Please try again.",
+                ),
+            ) from exc
+        except (ServiceUnavailable, InternalServerError) as exc:
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(
+                    exc,
+                    default="Gemini API is temporarily unavailable. Please try again shortly.",
+                ),
+            ) from exc
+        except BadRequest as exc:
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(
+                    exc,
+                    default="Gemini API rejected this request. Please try again with a different prompt.",
+                ),
+            ) from exc
         except GoogleAPIError as exc:
-            raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(exc),
+            ) from exc
         except Exception as exc:
-            raise LLMServiceError("gemini", self._extract_provider_error(exc)) from exc
+            raise LLMServiceError(
+                "gemini",
+                self._format_gemini_error(exc),
+            ) from exc
+
+    @classmethod
+    def _format_gemini_error(cls, exc: Exception, default: str = "Gemini API request failed.") -> str:
+        """Normalize Gemini failures without mislabeling unrelated issues as quota errors."""
+        error_text = cls._extract_provider_error(exc)
+        lowered = error_text.lower()
+        status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+
+        rate_limit_markers = (
+            "resource exhausted",
+            "resource_exhausted",
+            "quota",
+            "rate limit",
+            "too many requests",
+            "429",
+            "exceeded your current quota",
+        )
+        auth_markers = (
+            "api key",
+            "permission denied",
+            "permission_denied",
+            "unauthorized",
+            "unauthenticated",
+            "authentication",
+            "credential",
+        )
+        timeout_markers = ("timeout", "timed out", "deadline exceeded", "deadline_exceeded")
+        unavailable_markers = (
+            "service unavailable",
+            "temporarily unavailable",
+            "unavailable",
+            "internal error",
+            "backend error",
+            "overloaded",
+        )
+        bad_request_markers = (
+            "invalid argument",
+            "bad request",
+            "invalid",
+            "unsupported",
+            "blocked",
+        )
+
+        if status_code == 429 or any(marker in lowered for marker in rate_limit_markers):
+            return "Gemini API usage limit reached. Please try again shortly."
+        if status_code in {401, 403} or any(marker in lowered for marker in auth_markers):
+            return "Gemini API authentication failed. Please verify the configured API key and permissions."
+        if status_code == 504 or any(marker in lowered for marker in timeout_markers):
+            return "Gemini API request timed out. Please try again."
+        if status_code in {500, 502, 503} or any(
+            marker in lowered for marker in unavailable_markers
+        ):
+            return "Gemini API is temporarily unavailable. Please try again shortly."
+        if status_code == 400 or any(marker in lowered for marker in bad_request_markers):
+            return error_text or "Gemini API rejected this request."
+
+        return error_text or default
 
     async def _call_perplexity(self, messages: List[Dict]) -> Optional[str]:
         """

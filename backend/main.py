@@ -246,8 +246,27 @@ def to_user_friendly_query_error(raw_error: str | None) -> str:
 
     if not error_text:
         return "We couldn't find a result for that query. Please try rephrasing it."
+    if (
+        "quota" in lowered
+        or "rate limit" in lowered
+        or "resource exhausted" in lowered
+        or "resource_exhausted" in lowered
+        or "too many requests" in lowered
+        or "429" in lowered
+    ):
+        return "Gemini hit a temporary usage limit. Please try again shortly."
+    if (
+        "api key" in lowered
+        or "permission denied" in lowered
+        or "unauthorized" in lowered
+        or "unauthenticated" in lowered
+        or "authentication" in lowered
+    ):
+        return "Gemini couldn't be authenticated. Please verify the configured API key and permissions."
     if "connect" in lowered or "timeout" in lowered or "connection" in lowered:
         return "We couldn't reach the database just now. Please try again in a moment."
+    if "temporarily unavailable" in lowered or "service unavailable" in lowered:
+        return "Gemini is temporarily unavailable right now. Please try again shortly."
     if "syntax" in lowered or "parse" in lowered:
         return "We couldn't run that query successfully. Please try rephrasing it."
     if "validation failed" in lowered or "safe select" in lowered:

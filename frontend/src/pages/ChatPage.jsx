@@ -28,6 +28,10 @@ function persistChatTitle(chatId, title) {
   window.dispatchEvent(new Event("querify:chat-titles"));
 }
 
+function getInlineErrorMessage(error) {
+  return error?.response?.data?.detail || getErrorMessage(error);
+}
+
 export default function ChatPage() {
   const { chatId } = useParams();
   const { showToast } = useToast();
@@ -38,6 +42,7 @@ export default function ChatPage() {
   const [schemaOpen, setSchemaOpen] = useState(false);
   const [kpis, setKpis] = useState([]);
   const [kpiLoading, setKpiLoading] = useState(true);
+  const [kpiError, setKpiError] = useState("");
   const [historyLoading, setHistoryLoading] = useState(true);
   const [workspaceRefreshing, setWorkspaceRefreshing] = useState(false);
   const [prompt, setPrompt] = useState("");
@@ -62,36 +67,58 @@ export default function ChatPage() {
   }
   
   async function loadWorkspace({ silent = false } = {}) {
-    try {
-      if (silent) {
-        setWorkspaceRefreshing(true);
-      } else {
-        setHistoryLoading(true);
-      }
-      setKpiLoading(true);
-
-      const [historyData, kpiData, statusData] = await Promise.all([
-        getChatHistory(chatId),
-        getKpis({ session_id: chatId }),
-        getChatStatus(chatId),
-      ]);
-
-      setHistoryTitle(historyData.title);
-      persistChatTitle(chatId, historyData.title);
-      setMessages(normalizeMessages(historyData.messages));
-      setKpis(Array.isArray(kpiData?.kpis) ? kpiData.kpis : []);
-      setStatus(statusData);
-    } catch (error) {
-      showToast({
-        variant: "error",
-        title: "Workspace load failed",
-        description: getErrorMessage(error),
-      });
-    } finally {
-      setHistoryLoading(false);
-      setKpiLoading(false);
-      setWorkspaceRefreshing(false);
+    if (silent) {
+      setWorkspaceRefreshing(true);
+    } else {
+      setHistoryLoading(true);
     }
+
+    setKpiLoading(true);
+    setKpiError("");
+    setStatus(null);
+
+    const historyTask = getChatHistory(chatId)
+      .then((historyData) => {
+        setHistoryTitle(historyData.title);
+        persistChatTitle(chatId, historyData.title);
+        setMessages(normalizeMessages(historyData.messages));
+      })
+      .catch((error) => {
+        showToast({
+          variant: "error",
+          title: "Workspace load failed",
+          description: getErrorMessage(error),
+        });
+      })
+      .finally(() => {
+        setHistoryLoading(false);
+      });
+
+    const kpiTask = getKpis({ session_id: chatId })
+      .then((kpiData) => {
+        setKpis(Array.isArray(kpiData?.kpis) ? kpiData.kpis : []);
+      })
+      .catch((error) => {
+        setKpis([]);
+        setKpiError(getInlineErrorMessage(error));
+      })
+      .finally(() => {
+        setKpiLoading(false);
+      });
+
+    const statusTask = getChatStatus(chatId)
+      .then((statusData) => {
+        setStatus(statusData);
+      })
+      .catch((error) => {
+        setStatus({
+          reachable: false,
+          message: getInlineErrorMessage(error),
+        });
+      });
+
+    await Promise.allSettled([historyTask, kpiTask, statusTask]);
+    setWorkspaceRefreshing(false);
   }
 
   useEffect(() => {
@@ -270,6 +297,7 @@ export default function ChatPage() {
 
       <SuggestionChips
         items={kpis}
+        error={kpiError}
         loading={kpiLoading}
         onSelect={submitQuery}
       />
