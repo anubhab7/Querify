@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { DatabaseZap, Layers3, RefreshCw } from "lucide-react";
+import { Bot, DatabaseZap, Layers3, RefreshCw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 
@@ -9,7 +9,13 @@ import SuggestionChips from "../components/SuggestionChips";
 import { useToast } from "../hooks/useToast";
 import { getErrorMessage, getFriendlyQueryError } from "../services/api";
 import { getChatHistory, getChatStatus, getSchema } from "../services/chats";
-import { getKpis, runQuery } from "../services/query";
+import { getKpis, getLlmProviders, runQuery } from "../services/query";
+
+const FALLBACK_LLM_OPTIONS = [
+  { id: "sarvam", label: "Sarvam AI", configured: true, is_default: true },
+  { id: "gemini", label: "Gemini", configured: true, is_default: false },
+];
+const PREFERRED_MODEL_STORAGE_KEY = "querify_preferred_model";
 
 function buildChatTitleFromQuery(userInput) {
   const words = userInput.trim().split(/\s+/).filter(Boolean);
@@ -32,6 +38,15 @@ function getInlineErrorMessage(error) {
   return error?.response?.data?.detail || getErrorMessage(error);
 }
 
+function getStoredPreferredModel() {
+  return localStorage.getItem(PREFERRED_MODEL_STORAGE_KEY) || "sarvam";
+}
+
+function persistPreferredModel(modelId) {
+  if (!modelId) return;
+  localStorage.setItem(PREFERRED_MODEL_STORAGE_KEY, modelId);
+}
+
 export default function ChatPage() {
   const { chatId } = useParams();
   const { showToast } = useToast();
@@ -47,6 +62,8 @@ export default function ChatPage() {
   const [workspaceRefreshing, setWorkspaceRefreshing] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [availableModels, setAvailableModels] = useState(FALLBACK_LLM_OPTIONS);
+  const [selectedModel, setSelectedModel] = useState(getStoredPreferredModel);
   const bottomRef = useRef(null);
 
   function normalizeMessage(message, index = 0) {
@@ -94,7 +111,7 @@ export default function ChatPage() {
         setHistoryLoading(false);
       });
 
-    const kpiTask = getKpis({ session_id: chatId })
+    const kpiTask = getKpis({ session_id: chatId, preferred_model: selectedModel })
       .then((kpiData) => {
         setKpis(Array.isArray(kpiData?.kpis) ? kpiData.kpis : []);
       })
@@ -126,8 +143,48 @@ export default function ChatPage() {
   }, [messages.length]);
 
   useEffect(() => {
+    let isMounted = true;
+
+    async function loadProviderOptions() {
+      try {
+        const data = await getLlmProviders();
+        const providerOptions = Array.isArray(data?.providers) && data.providers.length
+          ? data.providers
+          : FALLBACK_LLM_OPTIONS;
+        const configuredProviders = Array.isArray(data?.providers)
+          ? data.providers.filter((provider) => provider?.configured)
+          : [];
+
+        if (!isMounted) {
+          return;
+        }
+
+        const selectableProviders = configuredProviders.length
+          ? configuredProviders
+          : providerOptions;
+
+        setAvailableModels(providerOptions);
+        const savedModel = getStoredPreferredModel();
+        const resolvedModel = selectableProviders.some((provider) => provider.id === savedModel)
+          ? savedModel
+          : data?.default_provider || selectableProviders[0]?.id || "sarvam";
+        persistPreferredModel(resolvedModel);
+        setSelectedModel(resolvedModel);
+      } catch (error) {
+        if (!isMounted) return;
+        setAvailableModels(FALLBACK_LLM_OPTIONS);
+      }
+    }
+
+    loadProviderOptions();
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  useEffect(() => {
     loadWorkspace();
-  }, [chatId]);
+  }, [chatId, selectedModel]);
 
   const headerCopy = useMemo(() => {
     if (status?.reachable) {
@@ -138,6 +195,19 @@ export default function ChatPage() {
     }
     return "Checking database reachability...";
   }, [status]);
+
+  const selectedProviderLabel = useMemo(
+    () =>
+      availableModels.find((provider) => provider.id === selectedModel)?.label ||
+      "The selected model",
+    [availableModels, selectedModel],
+  );
+
+  function handleModelChange(event) {
+    const nextModel = event.target.value;
+    persistPreferredModel(nextModel);
+    setSelectedModel(nextModel);
+  }
 
   async function submitQuery(rawInput) {
     const userInput = rawInput.trim();
@@ -172,7 +242,7 @@ export default function ChatPage() {
       const response = await runQuery({
         session_id: chatId,
         user_input: userInput,
-        preferred_model: "gemini",
+        preferred_model: selectedModel,
       });
 
       const resolvedTitle = response?.title || optimisticTitle;
@@ -264,8 +334,31 @@ export default function ChatPage() {
             </p>
             <h1 className="mt-2 text-3xl font-semibold text-slate-900">{historyTitle}</h1>
             <p className="mt-2 text-sm text-slate-500">{headerCopy}</p>
+            <p className="mt-1 text-xs font-medium uppercase tracking-[0.18em] text-slate-400">
+              Using {selectedProviderLabel} for KPI generation and query generation
+            </p>
           </div>
           <div className="flex flex-wrap gap-3">
+            <label className="inline-flex items-center gap-2 rounded-full border border-slate-300 bg-white px-4 py-2 text-sm text-slate-700">
+              <Bot className="h-4 w-4 text-slate-500" />
+              <span className="font-medium">Model</span>
+              <select
+                value={selectedModel}
+                onChange={handleModelChange}
+                disabled={!availableModels.some((provider) => provider.configured)}
+                className="bg-transparent text-sm font-medium text-slate-700 outline-none"
+              >
+                {availableModels.map((provider) => (
+                  <option
+                    key={provider.id}
+                    value={provider.id}
+                    disabled={!provider.configured}
+                  >
+                    {provider.label}
+                  </option>
+                ))}
+              </select>
+            </label>
             <button
               type="button"
               onClick={handleSchemaToggle}
@@ -299,6 +392,7 @@ export default function ChatPage() {
         items={kpis}
         error={kpiError}
         loading={kpiLoading}
+        providerLabel={selectedProviderLabel}
         onSelect={submitQuery}
       />
 

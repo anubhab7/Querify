@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 ROOT = Path(__file__).resolve().parent
 BACKEND_ENV = ROOT / "backend" / ".env"
 BASE_URL = os.getenv("QUERIFY_BASE_URL", "http://localhost:8000")
+PREFERRED_MODEL = os.getenv("QUERIFY_PREFERRED_MODEL", "sarvam")
 
 
 def load_env_file(path: Path) -> dict[str, str]:
@@ -151,6 +152,32 @@ def first_table_name(schema_text: str) -> str:
     raise SystemExit("Could not extract a table name from /schema response")
 
 
+def assert_one_line_kpis(kpis: Any) -> None:
+    if not isinstance(kpis, list) or not kpis:
+        raise SystemExit("POST /kpis did not return a populated KPI list")
+
+    for index, item in enumerate(kpis, start=1):
+        if not isinstance(item, dict):
+            raise SystemExit(f"KPI #{index} is not an object")
+
+        name = str(item.get("name", "")).strip()
+        description = str(item.get("description", "")).strip()
+        if not name:
+            raise SystemExit(f"KPI #{index} is missing a name")
+        if not description:
+            raise SystemExit(f"KPI #{index} is missing a description")
+        if "\n" in description or "\r" in description:
+            raise SystemExit(f"KPI #{index} description is not a single line")
+        if len(description) > 110:
+            raise SystemExit(
+                f"KPI #{index} description is too long ({len(description)} chars)"
+            )
+
+
+def normalize_sql(sql_query: str) -> str:
+    return " ".join(sql_query.lower().split())
+
+
 def main() -> None:
     client = HttpClient()
     suffix = int(time.time())
@@ -200,13 +227,13 @@ def main() -> None:
     status_code, body = client.request(
         "POST",
         "/kpis",
-        json_body={"session_id": chat_id},
+        json_body={"session_id": chat_id, "preferred_model": PREFERRED_MODEL},
         headers=auth_headers,
     )
     print_response("POST /kpis", status_code, body)
     expect_success("POST /kpis", status_code, body)
-    if not isinstance(body.get("kpis"), list) or not body["kpis"]:
-        raise SystemExit("POST /kpis did not return a populated KPI list")
+    assert_one_line_kpis(body.get("kpis"))
+    first_kpi_name = str(body["kpis"][0]["name"]).strip()
 
     status_code, body = client.request(
         "GET",
@@ -220,11 +247,10 @@ def main() -> None:
     if not isinstance(schema_text, str) or not schema_text.strip():
         raise SystemExit("GET /schema did not return schema text")
 
-    table_name = first_table_name(schema_text)
     query_payload = {
         "session_id": chat_id,
-        "user_input": f"Show the first 5 rows from {table_name}",
-        "preferred_model": "gemini",
+        "user_input": first_kpi_name,
+        "preferred_model": PREFERRED_MODEL,
     }
     status_code, body = client.request(
         "POST",
@@ -236,6 +262,11 @@ def main() -> None:
     expect_success("POST /query", status_code, body)
     if not body.get("sql_query") or not isinstance(body.get("results"), list):
         raise SystemExit("POST /query did not return SQL and result rows")
+    sql_query = normalize_sql(str(body["sql_query"]))
+    if not sql_query.startswith(("select ", "with ")):
+        raise SystemExit("POST /query did not return a SELECT/WITH statement")
+    if " from " not in sql_query:
+        raise SystemExit("POST /query did not reference a source table")
 
     status_code, body = client.request(
         "GET",
@@ -251,6 +282,8 @@ def main() -> None:
     latest_message = messages[-1]
     if not isinstance(latest_message.get("results"), list):
         raise SystemExit("History endpoint did not include results as an array")
+    if str(latest_message.get("user_input", "")).strip() != first_kpi_name:
+        raise SystemExit("History endpoint did not persist the KPI title as the user input")
 
     print("\nE2E flow passed successfully.")
 

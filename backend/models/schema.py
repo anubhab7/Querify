@@ -60,8 +60,8 @@ class QueryRequest(BaseModel):
     user_input: str = Field(..., min_length=1, description="Natural language query")
     session_id: str = Field(..., description="Chat session ID containing target DB credentials")
     preferred_model: Optional[str] = Field(
-        "gemini",
-        description="Preferred LLM model: 'gemini' or 'perplexity'",
+        "sarvam",
+        description="Preferred LLM provider (for example: 'sarvam', 'gemini')",
     )
 
 
@@ -70,6 +70,7 @@ class QueryResponse(BaseModel):
 
     session_id: str = Field(..., description="Chat session ID")
     title: Optional[str] = Field(None, description="Updated chat title")
+    model_used: Optional[str] = Field(None, description="LLM provider used for generation")
     sql_query: str = Field(..., description="Generated SQL query")
     explanation: str = Field(..., description="Explanation of what the query does")
     results: List[Dict[str, Any]] = Field(
@@ -96,6 +97,10 @@ class KPIRequest(BaseModel):
         None,
         description="Database schema (if not provided, will be fetched automatically)",
     )
+    preferred_model: Optional[str] = Field(
+        "sarvam",
+        description="Preferred LLM provider (for example: 'sarvam', 'gemini')",
+    )
 
 
 class KPIResponse(BaseModel):
@@ -103,6 +108,23 @@ class KPIResponse(BaseModel):
 
     kpis: List[KPISuggestion] = Field(..., description="List of suggested KPIs")
     explanation: str = Field(..., description="Overall explanation of suggested KPIs")
+    model_used: Optional[str] = Field(None, description="LLM provider used for generation")
+
+
+class LLMProviderInfo(BaseModel):
+    """Metadata about one LLM provider option."""
+
+    id: str = Field(..., description="Internal provider identifier")
+    label: str = Field(..., description="Provider label for display")
+    configured: bool = Field(..., description="Whether the provider is configured on the backend")
+    is_default: bool = Field(..., description="Whether this provider is the backend default")
+
+
+class LLMProvidersResponse(BaseModel):
+    """Response model for available LLM providers."""
+
+    default_provider: str = Field(..., description="Default LLM provider identifier")
+    providers: List[LLMProviderInfo] = Field(..., description="Available provider metadata")
 
 
 class TestConnectionRequest(BaseModel):

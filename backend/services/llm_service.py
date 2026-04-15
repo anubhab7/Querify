@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 import google.generativeai as genai
 
-from models.schema import ChatMessage, MessageRole
+from models.schema import ChatMessage
 
 logger = logging.getLogger(__name__)
 
@@ -46,36 +46,72 @@ class LLMServiceError(Exception):
 
 
 class LLMService:
-    """Service for LLM operations with Gemini and Perplexity support."""
+    """Service for LLM operations with pluggable provider support."""
 
     def __init__(
         self,
+        sarvam_api_key: Optional[str] = None,
         gemini_api_key: Optional[str] = None,
         perplexity_api_key: Optional[str] = None,
+        default_provider: str = "sarvam",
     ):
         """
         Initialize LLM service with API keys.
 
         Args:
+            sarvam_api_key: Sarvam AI API key (from environment if not provided)
             gemini_api_key: Gemini API key (from environment if not provided)
             perplexity_api_key: Perplexity API key (from environment if not provided)
+            default_provider: Preferred default provider when client does not specify one
         """
+        self.sarvam_api_key = sarvam_api_key or os.getenv("SARVAM_API_KEY")
         self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY")
         self.perplexity_api_key = perplexity_api_key or os.getenv("PERPLEXITY_API_KEY")
 
         if self.gemini_api_key:
             genai.configure(api_key=self.gemini_api_key)
 
-        self.gemini_model = "gemini-2.5-flash"
-        self.perplexity_model = "sonar-pro"
+        self.default_provider = default_provider.strip().lower() or "sarvam"
+        self.sarvam_model = os.getenv("SARVAM_MODEL", "sarvam-30b")
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        self.perplexity_model = os.getenv("PERPLEXITY_MODEL", "sonar-pro")
+        self.sarvam_endpoint = "https://api.sarvam.ai/v1/chat/completions"
         self.perplexity_endpoint = "https://api.perplexity.ai/chat/completions"
+        self.provider_order = ("sarvam", "gemini", "perplexity")
+        self.provider_labels = {
+            "sarvam": "Sarvam AI",
+            "gemini": "Gemini",
+            "perplexity": "Perplexity",
+        }
+
+        if self.default_provider not in self.provider_order:
+            logger.warning(
+                "Unsupported default provider '%s'; falling back to sarvam",
+                self.default_provider,
+            )
+            self.default_provider = "sarvam"
+
+    def get_provider_catalog(self) -> Dict[str, Any]:
+        """Expose provider metadata for the API/frontend."""
+        return {
+            "default_provider": self.default_provider,
+            "providers": [
+                {
+                    "id": provider_id,
+                    "label": self.provider_labels[provider_id],
+                    "configured": self._is_provider_configured(provider_id),
+                    "is_default": provider_id == self.default_provider,
+                }
+                for provider_id in self.provider_order
+            ],
+        }
 
     async def generate_sql_query(
         self,
         user_input: str,
         database_schema: str,
         chat_history: Optional[List[ChatMessage]] = None,
-        preferred_model: str = "gemini",
+        preferred_model: str = "sarvam",
     ) -> Tuple[Optional[str], Optional[str], str]:
         """
         Generate a SQL query from natural language input.
@@ -84,13 +120,13 @@ class LLMService:
             user_input: Natural language query
             database_schema: Compact database schema
             chat_history: Previous messages for context
-            preferred_model: 'gemini' or 'perplexity'
+            preferred_model: Provider identifier such as 'sarvam' or 'gemini'
 
         Returns:
             Tuple of (sql_query, explanation, model_used)
             If generation fails, sql_query will be None
         """
-        system_prompt = f"""You are a SQL query generator. Your task is to convert natural language questions into valid PostgreSQL queries.
+        system_prompt = f"""You are a senior analytics engineer. Your task is to convert natural language questions into valid PostgreSQL queries.
 
 DATABASE SCHEMA:
 {database_schema}
@@ -100,6 +136,12 @@ RULES:
 2. Always provide the SQL query wrapped in <sql></sql> tags
 3. Provide a brief explanation in <explanation></explanation> tags
 4. If you cannot generate a valid query, respond with <error></error> tags explaining why
+5. Only use tables and columns that exist in the schema
+6. Prefer explicit column lists instead of SELECT * unless the user explicitly asks for raw rows or all columns
+7. Use clear aliases, correct joins, and the right aggregation grain for KPI-style questions
+8. Add ORDER BY for rankings and time series when it improves readability
+9. Use LIMIT for preview-style requests
+10. The user input may be a short KPI title rather than a full sentence; infer the most schema-grounded analytical query without inventing fields
 
 Format your response exactly as:
 <sql>
@@ -118,36 +160,13 @@ Brief explanation of what the query does
 
         messages.append({"role": "user", "content": user_input})
 
-        # Try preferred model first, but skip Perplexity if it is unavailable or expired.
-        model_used = preferred_model
-        try:
-            result = await self._call_llm(preferred_model, messages)
-        except LLMServiceError as exc:
-            logger.error("%s query generation failed: %s", exc.provider, exc.message)
-            return None, exc.message, model_used
-        except Exception as exc:
-            logger.exception("Unexpected SQL generation failure")
-            return None, self._extract_provider_error(exc), model_used
-
-        if (result is None or result.strip() == "") and preferred_model != "gemini":
-            logger.warning(
-                f"Preferred model {preferred_model} failed, attempting fallback gemini"
-            )
-            model_used = "gemini"
-            try:
-                result = await self._call_llm("gemini", messages)
-            except LLMServiceError as exc:
-                logger.error("%s query generation failed: %s", exc.provider, exc.message)
-                return None, exc.message, model_used
-            except Exception as exc:
-                logger.exception("Unexpected Gemini fallback failure")
-                return None, self._extract_provider_error(exc), model_used
+        result, model_used, error_message = await self._generate_text(messages, preferred_model)
 
         if result is None or result.strip() == "":
             logger.warning("LLM generation unavailable and no SQL response was returned")
             return (
                 None,
-                "The LLM provider did not return a SQL query for this request.",
+                error_message or "The LLM provider did not return a SQL query for this request.",
                 model_used,
             )
 
@@ -164,14 +183,14 @@ Brief explanation of what the query does
     async def generate_kpi_suggestions(
         self,
         database_schema: str,
-        preferred_model: str = "gemini",
+        preferred_model: str = "sarvam",
     ) -> Tuple[Optional[List[Dict]], Optional[str], str]:
         """
         Generate KPI suggestions based on database schema.
 
         Args:
             database_schema: Compact database schema
-            preferred_model: 'gemini' or 'perplexity'
+            preferred_model: Provider identifier such as 'sarvam' or 'gemini'
 
         Returns:
             Tuple of (kpis: List[Dict], explanation: str, model_used: str)
@@ -179,52 +198,42 @@ Brief explanation of what the query does
         """
         system_prompt = """You are a business intelligence expert. Analyze the database schema and suggest 4 distinct, meaningful business KPIs.
 
-Format your response as a numbered list with clear descriptions:
-1. KPI Name: Description focusing on business value
-2. KPI Name: Description focusing on business value
-3. KPI Name: Description focusing on business value
-4. KPI Name: Description focusing on business value
+Requirements:
+- Each KPI name must be concise, query-ready, and usable as a standalone analytics prompt.
+- Each description must stay on a single line and be one short sentence.
+- Prefer KPIs that map directly to SQL using the available schema.
+- Do not describe your reasoning, steps, or analysis process.
 
-After the list, provide a brief explanation of how these KPIs work together."""
+Return valid JSON only with this exact shape:
+{
+  "kpis": [
+    {"number": 1, "name": "KPI Name", "description": "One-line description"},
+    {"number": 2, "name": "KPI Name", "description": "One-line description"},
+    {"number": 3, "name": "KPI Name", "description": "One-line description"},
+    {"number": 4, "name": "KPI Name", "description": "One-line description"}
+  ],
+  "explanation": "Brief explanation of how these KPIs work together."
+}"""
 
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "content": f"Database Schema:\n{database_schema}\n\nSuggest 4 business KPIs.",
+                "content": (
+                    f"Database Schema:\n{database_schema}\n\n"
+                    "Suggest 4 business KPIs and return JSON only."
+                ),
             },
         ]
 
-        # Try preferred model first, but skip Perplexity if it is unavailable or expired.
-        model_used = preferred_model
-        try:
-            result = await self._call_llm(preferred_model, messages)
-        except LLMServiceError as exc:
-            logger.error("%s KPI generation failed: %s", exc.provider, exc.message)
-            return None, exc.message, model_used
-        except Exception as exc:
-            logger.exception("Unexpected KPI generation failure")
-            return None, self._extract_provider_error(exc), model_used
-
-        if (result is None or result.strip() == "") and preferred_model != "gemini":
-            logger.warning(
-                f"Preferred model {preferred_model} failed, attempting fallback gemini"
-            )
-            model_used = "gemini"
-            try:
-                result = await self._call_llm("gemini", messages)
-            except LLMServiceError as exc:
-                logger.error("%s KPI generation failed: %s", exc.provider, exc.message)
-                return None, exc.message, model_used
-            except Exception as exc:
-                logger.exception("Unexpected Gemini KPI fallback failure")
-                return None, self._extract_provider_error(exc), model_used
+        result, model_used, error_message = await self._generate_text(messages, preferred_model)
 
         if result is None or result.strip() == "":
             logger.warning("LLM KPI generation unavailable and no KPI response was returned")
             return (
                 None,
-                "The LLM provider did not return KPI suggestions for this database.",
+                error_message
+                or "The LLM provider did not return KPI suggestions for this database.",
                 model_used,
             )
 
@@ -232,34 +241,173 @@ After the list, provide a brief explanation of how these KPIs work together."""
         kpis = self._parse_kpi_suggestions(result)
         explanation = self._extract_kpi_explanation(result)
 
-        if not kpis:
-            return (
-                None,
-                explanation
-                or "The LLM provider did not return valid KPI suggestions for this database.",
+        if not kpis or self._has_meta_kpi_content(kpis):
+            logger.warning(
+                "KPI suggestions from %s were invalid or meta; using heuristic fallback",
                 model_used,
             )
+            heuristic_kpis, heuristic_explanation = self._generate_kpis_heuristically(
+                database_schema
+            )
+            return heuristic_kpis, heuristic_explanation, model_used
 
         return kpis, explanation, model_used
 
+    async def _generate_text(
+        self,
+        messages: List[Dict],
+        preferred_model: Optional[str],
+    ) -> Tuple[Optional[str], str, Optional[str]]:
+        """Attempt text generation using the requested provider and sensible fallbacks."""
+        candidates = self._build_provider_candidates(preferred_model)
+        last_error: Optional[str] = None
+        last_provider = candidates[0] if candidates else self.default_provider
+
+        for provider_id in candidates:
+            last_provider = provider_id
+            try:
+                result = await self._call_llm(provider_id, messages)
+            except LLMServiceError as exc:
+                logger.error("%s generation failed: %s", exc.provider, exc.message)
+                last_error = exc.message
+                continue
+            except Exception as exc:
+                logger.exception("Unexpected %s generation failure", provider_id)
+                last_error = self._extract_provider_error(exc)
+                continue
+
+            if result and result.strip():
+                return result.strip(), provider_id, None
+
+            last_error = (
+                f"{self.provider_labels.get(provider_id, provider_id)} returned an empty response."
+            )
+
+        return None, last_provider, last_error
+
+    def _build_provider_candidates(self, preferred_model: Optional[str]) -> List[str]:
+        """Choose the ordered list of providers to try for this request."""
+        requested = (preferred_model or self.default_provider).strip().lower()
+        if requested not in self.provider_order:
+            raise LLMServiceError(
+                requested,
+                f"Unsupported LLM provider '{requested}'.",
+            )
+
+        candidates = [requested]
+        if self.default_provider not in candidates:
+            candidates.append(self.default_provider)
+
+        for provider_id in self.provider_order:
+            if provider_id in candidates or not self._is_provider_configured(provider_id):
+                continue
+            candidates.append(provider_id)
+
+        return candidates
+
     async def _call_llm(self, model: str, messages: List[Dict]) -> Optional[str]:
         """
-        Call LLM API (Gemini or Perplexity).
+        Call the configured LLM provider.
 
         Args:
-            model: 'gemini' or 'perplexity'
+            model: Provider identifier
             messages: List of message dicts with role and content
 
         Returns:
             LLM response or None if failed
         """
+        if model == "sarvam":
+            return await self._call_sarvam(messages)
         if model == "gemini":
             return await self._call_gemini(messages)
-        elif model == "perplexity":
+        if model == "perplexity":
             return await self._call_perplexity(messages)
-        else:
-            logger.error(f"Unknown model: {model}")
-            return None
+
+        raise LLMServiceError(model, f"Unsupported LLM provider '{model}'.")
+
+    def _is_provider_configured(self, provider_id: str) -> bool:
+        """Check whether a provider has the credentials it needs."""
+        api_keys = {
+            "sarvam": self.sarvam_api_key,
+            "gemini": self.gemini_api_key,
+            "perplexity": self.perplexity_api_key,
+        }
+        return bool(api_keys.get(provider_id))
+
+    async def _call_sarvam(self, messages: List[Dict]) -> Optional[str]:
+        """Call Sarvam AI's chat completions API."""
+        if not self.sarvam_api_key:
+            raise LLMServiceError("sarvam", "Sarvam AI API key not configured")
+
+        headers = {
+            "Authorization": f"Bearer {self.sarvam_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.sarvam_model,
+            "messages": self._normalize_chat_messages(messages),
+            "temperature": 0.2,
+            "max_tokens": 2048,
+            "reasoning_effort": "medium",
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    self.sarvam_endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=45),
+                ) as response:
+                    if response.status != 200:
+                        error_payload = await response.text()
+                        raise LLMServiceError(
+                            "sarvam",
+                            self._format_provider_error(
+                                "sarvam",
+                                Exception(error_payload),
+                                status_code=response.status,
+                                default="Sarvam AI request failed.",
+                            ),
+                        )
+
+                    data = await response.json()
+                    choices = data.get("choices") or []
+                    if not choices:
+                        raise LLMServiceError(
+                            "sarvam",
+                            "Sarvam AI returned an empty response for this request.",
+                        )
+
+                    message = choices[0].get("message", {})
+                    content = (
+                        (message.get("content") or "").strip()
+                        or (message.get("reasoning_content") or "").strip()
+                    )
+                    if content:
+                        return content
+
+                    raise LLMServiceError(
+                        "sarvam",
+                        "Sarvam AI returned an empty response for this request.",
+                    )
+        except asyncio.TimeoutError as exc:
+            raise LLMServiceError(
+                "sarvam",
+                self._format_provider_error(
+                    "sarvam",
+                    exc,
+                    status_code=504,
+                    default="Sarvam AI request timed out. Please try again.",
+                ),
+            ) from exc
+        except LLMServiceError:
+            raise
+        except Exception as exc:
+            raise LLMServiceError(
+                "sarvam",
+                self._format_provider_error("sarvam", exc),
+            ) from exc
 
     async def _call_gemini(self, messages: List[Dict]) -> Optional[str]:
         """
@@ -298,7 +446,8 @@ After the list, provide a brief explanation of how these KPIs work together."""
         except (ResourceExhausted, TooManyRequests) as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(
+                self._format_provider_error(
+                    "gemini",
                     exc,
                     default="Gemini API usage limit reached. Please try again shortly.",
                 ),
@@ -306,7 +455,8 @@ After the list, provide a brief explanation of how these KPIs work together."""
         except (Unauthenticated, PermissionDenied) as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(
+                self._format_provider_error(
+                    "gemini",
                     exc,
                     default="Gemini API authentication failed. Please verify the configured API key and permissions.",
                 ),
@@ -314,7 +464,8 @@ After the list, provide a brief explanation of how these KPIs work together."""
         except (DeadlineExceeded, asyncio.TimeoutError) as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(
+                self._format_provider_error(
+                    "gemini",
                     exc,
                     default="Gemini API request timed out. Please try again.",
                 ),
@@ -322,7 +473,8 @@ After the list, provide a brief explanation of how these KPIs work together."""
         except (ServiceUnavailable, InternalServerError) as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(
+                self._format_provider_error(
+                    "gemini",
                     exc,
                     default="Gemini API is temporarily unavailable. Please try again shortly.",
                 ),
@@ -330,7 +482,8 @@ After the list, provide a brief explanation of how these KPIs work together."""
         except BadRequest as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(
+                self._format_provider_error(
+                    "gemini",
                     exc,
                     default="Gemini API rejected this request. Please try again with a different prompt.",
                 ),
@@ -338,20 +491,35 @@ After the list, provide a brief explanation of how these KPIs work together."""
         except GoogleAPIError as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(exc),
+                self._format_provider_error("gemini", exc),
             ) from exc
         except Exception as exc:
             raise LLMServiceError(
                 "gemini",
-                self._format_gemini_error(exc),
+                self._format_provider_error("gemini", exc),
             ) from exc
 
     @classmethod
-    def _format_gemini_error(cls, exc: Exception, default: str = "Gemini API request failed.") -> str:
-        """Normalize Gemini failures without mislabeling unrelated issues as quota errors."""
+    def _format_provider_error(
+        cls,
+        provider: str,
+        exc: Exception,
+        status_code: Optional[int] = None,
+        default: Optional[str] = None,
+    ) -> str:
+        """Normalize provider failures without overfitting to one vendor."""
         error_text = cls._extract_provider_error(exc)
         lowered = error_text.lower()
-        status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        resolved_status = (
+            status_code
+            or getattr(exc, "code", None)
+            or getattr(exc, "status_code", None)
+        )
+        provider_label = {
+            "sarvam": "Sarvam AI",
+            "gemini": "Gemini",
+            "perplexity": "Perplexity",
+        }.get(provider, provider)
 
         rate_limit_markers = (
             "resource exhausted",
@@ -388,20 +556,23 @@ After the list, provide a brief explanation of how these KPIs work together."""
             "blocked",
         )
 
-        if status_code == 429 or any(marker in lowered for marker in rate_limit_markers):
-            return "Gemini API usage limit reached. Please try again shortly."
-        if status_code in {401, 403} or any(marker in lowered for marker in auth_markers):
-            return "Gemini API authentication failed. Please verify the configured API key and permissions."
-        if status_code == 504 or any(marker in lowered for marker in timeout_markers):
-            return "Gemini API request timed out. Please try again."
-        if status_code in {500, 502, 503} or any(
+        if resolved_status == 429 or any(marker in lowered for marker in rate_limit_markers):
+            return f"{provider_label} API usage limit reached. Please try again shortly."
+        if resolved_status in {401, 403} or any(marker in lowered for marker in auth_markers):
+            return (
+                f"{provider_label} API authentication failed. "
+                "Please verify the configured API key and permissions."
+            )
+        if resolved_status == 504 or any(marker in lowered for marker in timeout_markers):
+            return f"{provider_label} API request timed out. Please try again."
+        if resolved_status in {500, 502, 503} or any(
             marker in lowered for marker in unavailable_markers
         ):
-            return "Gemini API is temporarily unavailable. Please try again shortly."
-        if status_code == 400 or any(marker in lowered for marker in bad_request_markers):
-            return error_text or "Gemini API rejected this request."
+            return f"{provider_label} API is temporarily unavailable. Please try again shortly."
+        if resolved_status == 400 or any(marker in lowered for marker in bad_request_markers):
+            return error_text or f"{provider_label} API rejected this request."
 
-        return error_text or default
+        return error_text or default or f"{provider_label} API request failed."
 
     async def _call_perplexity(self, messages: List[Dict]) -> Optional[str]:
         """
@@ -451,10 +622,11 @@ After the list, provide a brief explanation of how these KPIs work together."""
                         error_payload = await response.text()
                         raise LLMServiceError(
                             "perplexity",
-                            self._extract_provider_error(
-                                Exception(
-                                    f"Perplexity API error {response.status}: {error_payload}"
-                                )
+                            self._format_provider_error(
+                                "perplexity",
+                                Exception(error_payload),
+                                status_code=response.status,
+                                default="Perplexity API request failed.",
                             ),
                         )
 
@@ -470,6 +642,23 @@ After the list, provide a brief explanation of how these KPIs work together."""
             ) from exc
 
         return None
+
+    @staticmethod
+    def _normalize_chat_messages(messages: List[Dict]) -> List[Dict]:
+        """Normalize outbound chat messages for providers that follow OpenAI-style schemas."""
+        normalized: List[Dict] = []
+        for msg in messages:
+            role = str(msg.get("role", "user")).lower()
+            if role not in {"system", "user", "assistant"}:
+                role = "user"
+
+            normalized.append(
+                {
+                    "role": role,
+                    "content": str(msg.get("content", "")).strip(),
+                }
+            )
+        return normalized
 
     @staticmethod
     def _extract_provider_error(exc: Exception) -> str:
@@ -667,7 +856,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 {
                     "number": len(kpis) + 1,
                     "name": "Total Bookings",
-                    "description": f"Track booking volume over time from {full_names['bookings']} to monitor sales activity.",
+                    "description": f"Track booking volume trends from {full_names['bookings']}.",
                 }
             )
         if "payments" in full_names:
@@ -675,7 +864,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 {
                     "number": len(kpis) + 1,
                     "name": "Payment Collection Value",
-                    "description": f"Sum payment amounts in {full_names['payments']} to measure realized revenue.",
+                    "description": f"Measure realized revenue from {full_names['payments']}.",
                 }
             )
         if "trips" in full_names and "bookings" in full_names:
@@ -683,7 +872,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 {
                     "number": len(kpis) + 1,
                     "name": "Trip Utilization",
-                    "description": f"Compare booking counts in {full_names['bookings']} against trip capacity in {full_names['trips']} to identify underbooked or full trips.",
+                    "description": f"Compare bookings and capacity across {full_names['trips']}.",
                 }
             )
         if "customers" in full_names:
@@ -691,7 +880,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 {
                     "number": len(kpis) + 1,
                     "name": "New Customer Acquisition",
-                    "description": f"Measure how many customers are added over time using {full_names['customers']}.",
+                    "description": f"Measure customer growth from {full_names['customers']}.",
                 }
             )
         if "destinations" in full_names and "trips" in full_names:
@@ -699,7 +888,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 {
                     "number": len(kpis) + 1,
                     "name": "Destination Performance",
-                    "description": f"Join {full_names['trips']} with {full_names['destinations']} to see which destinations drive the most offerings and bookings.",
+                    "description": "See which destinations drive the most trip activity.",
                 }
             )
 
@@ -709,7 +898,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
                 {
                     "number": len(kpis) + 1,
                     "name": f"{table['table'].replace('_', ' ').title()} Activity",
-                    "description": f"Track row growth and recent activity in {table['full_name']} to monitor operational changes.",
+                    "description": f"Track recent activity in {table['full_name']}.",
                 }
             )
 
@@ -899,7 +1088,9 @@ After the list, provide a brief explanation of how these KPIs work together."""
             else:
                 name, description = stripped, stripped
             cleaned_name = clean_label(name)
-            cleaned_description = clean_label(description)
+            cleaned_description = LLMService._to_single_line_kpi_description(
+                clean_label(description)
+            )
             if cleaned_name.lower() in {"kpi", "kpi name", "name"} and cleaned_description:
                 cleaned_name = cleaned_description
             return {
@@ -931,6 +1122,7 @@ After the list, provide a brief explanation of how these KPIs work together."""
             name = description[:80].strip()
         if not description and name:
             description = name
+        description = LLMService._to_single_line_kpi_description(description)
         if not name:
             return None
 
@@ -947,9 +1139,64 @@ After the list, provide a brief explanation of how these KPIs work together."""
         }
 
     @staticmethod
+    def _to_single_line_kpi_description(
+        description: str,
+        *,
+        max_length: int = 110,
+    ) -> str:
+        """Collapse verbose KPI descriptions into a short single-line summary."""
+        normalized = re.sub(r"\s+", " ", (description or "")).strip(" :.-").strip()
+        if not normalized:
+            return ""
+
+        sentence_match = re.match(r"^(.+?[.!?])(?:\s|$)", normalized)
+        if sentence_match:
+            normalized = sentence_match.group(1).strip()
+
+        if len(normalized) <= max_length:
+            return normalized
+
+        shortened = normalized[: max_length - 3].rsplit(" ", 1)[0].strip(" ,;:-")
+        return f"{shortened or normalized[: max_length - 3].strip()}..."
+
+    @staticmethod
+    def _has_meta_kpi_content(kpis: List[Dict[str, Any]]) -> bool:
+        """Reject KPI lists that are really planning steps or prompt analysis."""
+        meta_markers = (
+            "deconstruct",
+            "analyze the database schema",
+            "brainstorm",
+            "selecting the final",
+            "request",
+            "schema",
+            "reasoning",
+            "requirements",
+            "output format",
+        )
+        flagged = 0
+
+        for item in kpis:
+            combined = " ".join(
+                [
+                    str(item.get("name", "")),
+                    str(item.get("description", "")),
+                ]
+            ).lower()
+            if any(marker in combined for marker in meta_markers):
+                flagged += 1
+
+        return flagged >= 2
+
+    @staticmethod
     def _extract_kpi_explanation(response: str) -> Optional[str]:
         """Extract explanation section from KPI response (after numbered list)."""
         try:
+            json_payload = LLMService._extract_json_payload(response)
+            if isinstance(json_payload, dict):
+                explanation = str(json_payload.get("explanation") or "").strip()
+                if explanation:
+                    return explanation
+
             lines = response.split("\n")
             explanation_lines = []
             found_explanation = False

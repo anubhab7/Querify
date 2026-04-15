@@ -60,7 +60,7 @@ export default function LandingPage() {
               Ask better questions of your PostgreSQL data.
             </h1>
             <p className="mt-6 text-lg leading-8 text-slate-600">
-              Connect a database, generate KPI prompts automatically, and explore results through a clean Gemini-style workspace.
+              Connect a database, generate KPI prompts automatically, and explore results through a clean multi-model analytics workspace.
             </p>
           </div>
 

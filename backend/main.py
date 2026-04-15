@@ -28,6 +28,8 @@ from models.schema import (
     ChatSummary,
     DatabaseConnectRequest,
     DatabaseConnectResponse,
+    LLMProviderInfo,
+    LLMProvidersResponse,
     KPIRequest,
     KPIResponse,
     KPISuggestion,
@@ -60,6 +62,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql://user:password@localhost:5432/querify_db"
     app_database_url: Optional[str] = None
+    sarvam_api_key: Optional[str] = None
     gemini_api_key: Optional[str] = None
     perplexity_api_key: Optional[str] = None
     api_host: str = "0.0.0.0"
@@ -254,7 +257,7 @@ def to_user_friendly_query_error(raw_error: str | None) -> str:
         or "too many requests" in lowered
         or "429" in lowered
     ):
-        return "Gemini hit a temporary usage limit. Please try again shortly."
+        return "The selected model hit a temporary usage limit. Please try again shortly."
     if (
         "api key" in lowered
         or "permission denied" in lowered
@@ -262,11 +265,11 @@ def to_user_friendly_query_error(raw_error: str | None) -> str:
         or "unauthenticated" in lowered
         or "authentication" in lowered
     ):
-        return "Gemini couldn't be authenticated. Please verify the configured API key and permissions."
+        return "The selected model couldn't be authenticated. Please verify the configured API key and permissions."
     if "connect" in lowered or "timeout" in lowered or "connection" in lowered:
         return "We couldn't reach the database just now. Please try again in a moment."
     if "temporarily unavailable" in lowered or "service unavailable" in lowered:
-        return "Gemini is temporarily unavailable right now. Please try again shortly."
+        return "The selected model is temporarily unavailable right now. Please try again shortly."
     if "syntax" in lowered or "parse" in lowered:
         return "We couldn't run that query successfully. Please try rephrasing it."
     if "validation failed" in lowered or "safe select" in lowered:
@@ -280,6 +283,21 @@ def normalize_kpi_items(raw_kpis) -> list[dict]:
     """Coerce mixed KPI output into the response model's expected dictionary shape."""
     def clean_label(value: str) -> str:
         return value.replace("*", "").replace("`", "").replace("_", "").strip(" :.-").strip()
+
+    def to_single_line(value: str, max_length: int = 110) -> str:
+        normalized = " ".join((value or "").split()).strip(" :.-").strip()
+        if not normalized:
+            return ""
+
+        sentence_match = re.match(r"^(.+?[.!?])(?:\s|$)", normalized)
+        if sentence_match:
+            normalized = sentence_match.group(1).strip()
+
+        if len(normalized) <= max_length:
+            return normalized
+
+        shortened = normalized[: max_length - 3].rsplit(" ", 1)[0].strip(" ,;:-")
+        return f"{shortened or normalized[: max_length - 3].strip()}..."
 
     if not isinstance(raw_kpis, list):
         return []
@@ -313,6 +331,7 @@ def normalize_kpi_items(raw_kpis) -> list[dict]:
             name = description[:80].strip()
         if not description and name:
             description = name
+        description = to_single_line(description)
         if not name:
             continue
 
@@ -349,8 +368,10 @@ async def lifespan(app: FastAPI):
         logger.info("App database connection pool initialized")
 
         llm_service = LLMService(
+            sarvam_api_key=settings.sarvam_api_key,
             gemini_api_key=settings.gemini_api_key,
             perplexity_api_key=settings.perplexity_api_key,
+            default_provider="sarvam",
         )
         logger.info("LLM service initialized")
 
@@ -404,6 +425,25 @@ async def database_connection_exception_handler(request, exc: DatabaseConnection
 async def health_check():
     """Health check endpoint."""
     return {"status": "ok", "service": "querify", "version": "2.0.0"}
+
+
+@app.get("/llm/providers", response_model=LLMProvidersResponse, tags=["LLM"])
+async def get_llm_providers():
+    """List configured LLM providers so the frontend can offer valid choices."""
+    _, llm, _ = await require_services()
+    catalog = llm.get_provider_catalog()
+    return LLMProvidersResponse(
+        default_provider=catalog["default_provider"],
+        providers=[
+            LLMProviderInfo(
+                id=provider["id"],
+                label=provider["label"],
+                configured=provider["configured"],
+                is_default=provider["is_default"],
+            )
+            for provider in catalog["providers"]
+        ],
+    )
 
 
 @app.post("/auth/register", response_model=AuthResponse, tags=["Authentication"])
@@ -738,13 +778,14 @@ async def generate_query(
                 user_input=resolved_input,
                 database_schema=schema,
                 chat_history=history,
-                preferred_model=request.preferred_model or "gemini",
+                preferred_model=request.preferred_model or llm.default_provider,
             )
         except Exception as exc:
             logger.exception("LLM query generation failed")
             return QueryResponse(
                 session_id=request.session_id,
                 title=next_chat_title,
+                model_used=request.preferred_model or llm.default_provider,
                 sql_query="",
                 explanation="The assistant could not generate a SQL query.",
                 results=[],
@@ -755,6 +796,7 @@ async def generate_query(
             return QueryResponse(
                 session_id=request.session_id,
                 title=next_chat_title,
+                model_used=_model_used,
                 sql_query="",
                 explanation=explanation or "The assistant could not generate a SQL query.",
                 results=[],
@@ -766,6 +808,7 @@ async def generate_query(
             return QueryResponse(
                 session_id=request.session_id,
                 title=next_chat_title,
+                model_used=_model_used,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
@@ -779,6 +822,7 @@ async def generate_query(
             return QueryResponse(
                 session_id=request.session_id,
                 title=next_chat_title,
+                model_used=_model_used,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
@@ -789,6 +833,7 @@ async def generate_query(
             return QueryResponse(
                 session_id=request.session_id,
                 title=next_chat_title,
+                model_used=_model_used,
                 sql_query=sql_query,
                 explanation=explanation or "",
                 results=[],
@@ -809,6 +854,7 @@ async def generate_query(
     return QueryResponse(
         session_id=request.session_id,
         title=next_chat_title,
+        model_used=_model_used,
         sql_query=sql_query,
         explanation=explanation or "",
         results=results,
@@ -845,7 +891,7 @@ async def get_kpi_suggestions(
     try:
         kpis, explanation, _model_used = await llm.generate_kpi_suggestions(
             database_schema=schema,
-            preferred_model="gemini",
+            preferred_model=request.preferred_model or llm.default_provider,
         )
     except Exception as exc:
         logger.exception("LLM KPI generation failed")
@@ -872,6 +918,7 @@ async def get_kpi_suggestions(
             for index, kpi in enumerate(normalized_kpis[:4])
         ],
         explanation=explanation or "KPI suggestions generated successfully",
+        model_used=_model_used,
     )
 
 

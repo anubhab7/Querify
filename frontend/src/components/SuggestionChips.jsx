@@ -1,7 +1,13 @@
 import { motion } from "framer-motion";
 import { Sparkles } from "lucide-react";
 
-export default function SuggestionChips({ items, onSelect, loading, error }) {
+export default function SuggestionChips({
+  items,
+  onSelect,
+  loading,
+  error,
+  providerLabel = "The selected model",
+}) {
   if (loading) {
     return (
       <div className="rounded-3xl border border-slate-200 bg-white/80 p-6 shadow-soft">
@@ -13,7 +19,7 @@ export default function SuggestionChips({ items, onSelect, loading, error }) {
           <div className="h-10 w-10 animate-spin rounded-full border-4 border-slate-200 border-t-emerald-500" />
           <p className="mt-4 text-base font-semibold text-slate-900">Loading KPIs</p>
           <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
-            Gemini is analyzing the connected schema and preparing suggested KPI prompts.
+            {providerLabel} is analyzing the connected schema and preparing suggested KPI prompts.
           </p>
         </div>
       </div>
@@ -53,7 +59,7 @@ export default function SuggestionChips({ items, onSelect, loading, error }) {
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             transition={{ delay: index * 0.05 }}
-            onClick={() => onSelect(item.description)}
+            onClick={() => onSelect(item.name)}
             className="rounded-2xl border border-slate-200 bg-slate-50/90 p-4 text-left text-sm text-slate-700 shadow-sm transition hover:border-indigo-300 hover:bg-white hover:text-slate-900"
           >
             <div className="mb-2 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.2em] text-emerald-600">
