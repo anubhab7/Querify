@@ -1075,7 +1075,14 @@ Return valid JSON only with this exact shape:
     def _coerce_kpi_item(item: Any, index: int) -> Optional[Dict[str, Any]]:
         """Normalize one KPI item into the API's expected dictionary shape."""
         def clean_label(value: str) -> str:
-            return re.sub(r"[*_`]+", "", value).strip(" :.-").strip()
+            value = value.replace("_", " ")
+            value = re.sub(r"[*`]+", "", value).strip(" :.-").strip()
+            return re.sub(r"\s+", " ", value)
+
+        def format_kpi_name(value: str) -> str:
+            spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", value)
+            spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+            return re.sub(r"\s+", " ", spaced).strip()
 
         if isinstance(item, str):
             stripped = item.strip()
@@ -1087,7 +1094,7 @@ Return valid JSON only with this exact shape:
                 name, description = stripped.split(" - ", 1)
             else:
                 name, description = stripped, stripped
-            cleaned_name = clean_label(name)
+            cleaned_name = format_kpi_name(clean_label(name))
             cleaned_description = LLMService._to_single_line_kpi_description(
                 clean_label(description)
             )
@@ -1102,9 +1109,9 @@ Return valid JSON only with this exact shape:
         if not isinstance(item, dict):
             return None
 
-        name = clean_label(
+        name = format_kpi_name(clean_label(
             str(item.get("name") or item.get("title") or item.get("kpi") or "").strip()
-        )
+        ))
         description = clean_label(
             str(
             item.get("description")
