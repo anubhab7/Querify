@@ -245,3 +245,50 @@ class ErrorResponse(BaseModel):
 
     error: str = Field(..., description="Error message")
     detail: Optional[str] = Field(None, description="Additional error details")
+
+
+class ReportCreateRequest(BaseModel):
+    """Request model for creating a new report."""
+    
+    name: str = Field(..., min_length=1, description="Name of the report")
+    description: Optional[str] = Field(None, description="Optional description of the report")
+
+
+class ReportResponse(BaseModel):
+    """Response model for a report."""
+    
+    id: str
+    user_id: str
+    name: str
+    description: Optional[str]
+    created_at: datetime
+    updated_at: datetime
+    item_count: Optional[int] = Field(0, description="Number of items in the report")
+
+
+class ReportItemCreateRequest(BaseModel):
+    """Request model for adding an item to a report."""
+    
+    query_text: Optional[str] = Field(None, description="The original natural language query")
+    sql_query: Optional[str] = Field(None, description="The generated SQL query")
+    data_snapshot: List[Dict[str, Any]] = Field(..., description="The query results snapshot")
+    explanation: Optional[str] = Field(None, description="The explanation of the query")
+
+
+class ReportItemResponse(BaseModel):
+    """Response model for a report item."""
+    
+    id: str
+    report_id: str
+    query_text: Optional[str]
+    sql_query: Optional[str]
+    data_snapshot: List[Dict[str, Any]]
+    explanation: Optional[str]
+    created_at: datetime
+
+
+class ReportDetailResponse(BaseModel):
+    """Response model for a report with its items."""
+    
+    report: ReportResponse
+    items: List[ReportItemResponse]

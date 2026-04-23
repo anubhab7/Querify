@@ -50,4 +50,36 @@ export function getFriendlyQueryError(error) {
   return "We couldn't find a result for that query. Please try rephrasing it.";
 }
 
+export const createReport = async (data) => {
+  const response = await api.post('/reports', data);
+  return response.data;
+};
+
+export const fetchReports = async () => {
+  const response = await api.get('/reports');
+  return response.data;
+};
+
+export const fetchReportDetails = async (reportId) => {
+  const response = await api.get(`/reports/${reportId}`);
+  return response.data;
+};
+
+export const addReportItem = async (reportId, data) => {
+  const response = await api.post(`/reports/${reportId}/items`, data);
+  return response.data;
+};
+
+export const deleteReportItem = async (itemId) => {
+  const response = await api.delete(`/reports/items/${itemId}`);
+  return response.data;
+};
+
+export const generateReportPdf = async (reportId) => {
+  const response = await api.post(`/reports/${reportId}/generate`, {}, {
+    responseType: 'blob'
+  });
+  return response.data;
+};
+
 export default api;

@@ -205,3 +205,11 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local ad hoc verification scripts
+backend/check_schema.py
+backend/fix_db.py
+backend/test_api.py
+backend/test_api_integration.py
+backend/test_reports_api.py
+/test_reports_api.py

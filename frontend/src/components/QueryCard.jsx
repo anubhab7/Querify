@@ -1,9 +1,13 @@
 import { motion } from "framer-motion";
-import { Bot, Code2, LoaderCircle, UserRound } from "lucide-react";
+import { Bot, Code2, LoaderCircle, UserRound, BookmarkPlus } from "lucide-react";
+import { useState } from "react";
+import { Menu, MenuItem, IconButton, Tooltip } from "@mui/material";
 
 import ResultsTable from "./ResultsTable";
 
-export default function QueryCard({ item }) {
+export default function QueryCard({ item, reports = [], onAddToReport }) {
+  const [anchorEl, setAnchorEl] = useState(null);
+  
   const results = Array.isArray(item?.results)
     ? item.results.filter((row) => row && typeof row === "object" && !Array.isArray(row))
     : [];
@@ -70,9 +74,33 @@ export default function QueryCard({ item }) {
 
                 {results.length > 0 ? (
                   <div>
-                    <p className="mb-3 text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">
-                      Results
-                    </p>
+                    <div className="mb-3 flex items-center justify-between">
+                      <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">
+                        Results
+                      </p>
+                      <div>
+                        <Tooltip title="Add to Report">
+                          <IconButton size="small" onClick={(e) => setAnchorEl(e.currentTarget)}>
+                            <BookmarkPlus className="h-4 w-4 text-indigo-500" />
+                          </IconButton>
+                        </Tooltip>
+                        <Menu 
+                          anchorEl={anchorEl} 
+                          open={Boolean(anchorEl)} 
+                          onClose={() => setAnchorEl(null)}
+                        >
+                          {reports.length === 0 ? (
+                              <MenuItem disabled>No reports available</MenuItem>
+                          ) : (
+                            reports.map(r => (
+                              <MenuItem key={r.id} onClick={() => { setAnchorEl(null); onAddToReport(r.id); }}>
+                                {r.name}
+                              </MenuItem>
+                            ))
+                          )}
+                        </Menu>
+                      </div>
+                    </div>
                     <ResultsTable rows={results} />
                   </div>
                 ) : null}

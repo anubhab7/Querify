@@ -5,6 +5,7 @@ query safety validation, and data sampling.
 """
 
 import logging
+import json
 import re
 import socket
 import ssl as ssl_lib
@@ -365,6 +366,36 @@ class DatabaseService:
                     ON messages(chat_id, created_at ASC);
                 """
             )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reports (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    name VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            await connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS report_items (
+                    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                    report_id UUID NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+                    query_text TEXT,
+                    sql_query TEXT,
+                    data_snapshot JSONB NOT NULL,
+                    explanation TEXT,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            await connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_report_items_report_id ON report_items(report_id);
+                """
+            )
 
     async def test_connection(self) -> bool:
         """Test the current database connection."""
@@ -654,3 +685,107 @@ class DatabaseService:
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl_lib.CERT_NONE
         return ssl_context
+
+    # --- Reports Logic ---
+
+    async def create_report(self, user_id: str, name: str, description: Optional[str]) -> Dict[str, Any]:
+        """Create a new report container."""
+        query = """
+            INSERT INTO reports (user_id, name, description)
+            VALUES ($1::uuid, $2, $3)
+            RETURNING id, user_id, name, description, created_at, updated_at;
+        """
+        row = await self.fetchrow(query, user_id, name, description)
+        assert row is not None
+        result = dict(row)
+        result['id'] = str(result['id'])
+        result['user_id'] = str(result['user_id'])
+        return result
+
+    async def get_reports_by_user(self, user_id: str) -> List[Dict[str, Any]]:
+        """Get all reports for a user, including item count."""
+        query = """
+            SELECT r.id, r.user_id, r.name, r.description, r.created_at, r.updated_at,
+                   COUNT(i.id) as item_count
+            FROM reports r
+            LEFT JOIN report_items i ON r.id = i.report_id
+            WHERE r.user_id = $1::uuid
+            GROUP BY r.id
+            ORDER BY r.created_at DESC;
+        """
+        rows = await self.fetch(query, user_id)
+        results = []
+        for row in rows:
+            r = dict(row)
+            r['id'] = str(r['id'])
+            r['user_id'] = str(r['user_id'])
+            results.append(r)
+        return results
+
+    async def get_report_by_id(self, report_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single report by ID for a user."""
+        query = """
+            SELECT r.id, r.user_id, r.name, r.description, r.created_at, r.updated_at,
+                   COUNT(i.id) as item_count
+            FROM reports r
+            LEFT JOIN report_items i ON r.id = i.report_id
+            WHERE r.id = $1::uuid AND r.user_id = $2::uuid
+            GROUP BY r.id;
+        """
+        row = await self.fetchrow(query, report_id, user_id)
+        if not row:
+            return None
+        result = dict(row)
+        result['id'] = str(result['id'])
+        result['user_id'] = str(result['user_id'])
+        return result
+
+    async def add_item_to_report(self, report_id: str, query_text: Optional[str], sql_query: Optional[str], data_snapshot: List[Dict[str, Any]], explanation: Optional[str]) -> Dict[str, Any]:
+        """Add a snapshot to a report."""
+        query = """
+            INSERT INTO report_items (report_id, query_text, sql_query, data_snapshot, explanation)
+            VALUES ($1::uuid, $2, $3, $4::jsonb, $5)
+            RETURNING id, report_id, query_text, sql_query, data_snapshot, explanation, created_at;
+        """
+        row = await self.fetchrow(query, report_id, query_text, sql_query, json.dumps(data_snapshot), explanation)
+        assert row is not None
+        result = dict(row)
+        result['id'] = str(result['id'])
+        result['report_id'] = str(result['report_id'])
+        if isinstance(result['data_snapshot'], str):
+            result['data_snapshot'] = json.loads(result['data_snapshot'])
+        return result
+
+    async def get_items_by_report(self, report_id: str) -> List[Dict[str, Any]]:
+        """Get all items in a report."""
+        query = """
+            SELECT id, report_id, query_text, sql_query, data_snapshot, explanation, created_at
+            FROM report_items
+            WHERE report_id = $1::uuid
+            ORDER BY created_at ASC;
+        """
+        rows = await self.fetch(query, report_id)
+        
+        results = []
+        for row in rows:
+            result = dict(row)
+            result['id'] = str(result['id'])
+            result['report_id'] = str(result['report_id'])
+            if isinstance(result['data_snapshot'], str):
+                result['data_snapshot'] = json.loads(result['data_snapshot'])
+            results.append(result)
+        return results
+
+    async def delete_report_item(self, item_id: str, user_id: str) -> bool:
+        """Delete an item from a report, verifying ownership."""
+        query = """
+            DELETE FROM report_items
+            USING reports
+            WHERE report_items.report_id = reports.id
+              AND report_items.id = $1::uuid
+              AND reports.user_id = $2::uuid
+            RETURNING report_items.id;
+        """
+        row = await self.fetchrow(query, item_id, user_id)
+        return row is not None
+

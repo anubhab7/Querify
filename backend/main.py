@@ -42,6 +42,11 @@ from models.schema import (
     UserLoginRequest,
     UserRegisterRequest,
     UserResponse,
+    ReportCreateRequest,
+    ReportResponse,
+    ReportItemCreateRequest,
+    ReportItemResponse,
+    ReportDetailResponse,
 )
 from services.chat_session import ChatSessionManager
 from services.database_service import DatabaseConnectionError, DatabaseService
@@ -958,6 +963,188 @@ async def http_exception_handler(request, exc):
             "detail": detail_text,
             "status_code": exc.status_code,
         },
+    )
+
+
+# --- Reports Endpoints ---
+
+@app.post("/reports", response_model=ReportResponse, tags=["Reports"])
+async def create_report_endpoint(
+    request: ReportCreateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    app_db, _, _ = await require_services()
+    report = await app_db.create_report(str(current_user["id"]), request.name, request.description)
+    report['item_count'] = 0
+    return report
+
+
+@app.get("/reports", response_model=list[ReportResponse], tags=["Reports"])
+async def list_reports(current_user: dict = Depends(get_current_user)):
+    app_db, _, _ = await require_services()
+    reports = await app_db.get_reports_by_user(str(current_user["id"]))
+    return reports
+
+
+@app.get("/reports/{report_id}", response_model=ReportDetailResponse, tags=["Reports"])
+async def get_report_detail(report_id: str, current_user: dict = Depends(get_current_user)):
+    app_db, _, _ = await require_services()
+    report = await app_db.get_report_by_id(report_id, str(current_user["id"]))
+    if not report:
+        raise_api_error(status.HTTP_404_NOT_FOUND, "REPORT_NOT_FOUND", "Report not found")
+    items = await app_db.get_items_by_report(report_id)
+    return {"report": report, "items": items}
+
+
+@app.post("/reports/{report_id}/items", response_model=ReportItemResponse, tags=["Reports"])
+async def add_report_item(
+    report_id: str,
+    request: ReportItemCreateRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    app_db, _, _ = await require_services()
+    report = await app_db.get_report_by_id(report_id, str(current_user["id"]))
+    if not report:
+        raise_api_error(status.HTTP_404_NOT_FOUND, "REPORT_NOT_FOUND", "Report not found")
+    
+    item = await app_db.add_item_to_report(
+        report_id,
+        request.query_text,
+        request.sql_query,
+        request.data_snapshot,
+        request.explanation
+    )
+    return item
+
+
+@app.delete("/reports/items/{item_id}", tags=["Reports"])
+async def delete_report_item(
+    item_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    app_db, _, _ = await require_services()
+    success = await app_db.delete_report_item(item_id, str(current_user["id"]))
+    if not success:
+        raise_api_error(status.HTTP_404_NOT_FOUND, "ITEM_NOT_FOUND", "Item not found or access denied")
+    return {"message": "Success"}
+
+
+@app.post("/reports/{report_id}/generate", tags=["Reports"])
+async def generate_report_pdf(
+    report_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    app_db, _, _ = await require_services()
+    report = await app_db.get_report_by_id(report_id, str(current_user["id"]))
+    if not report:
+        raise_api_error(status.HTTP_404_NOT_FOUND, "REPORT_NOT_FOUND", "Report not found")
+        
+    items = await app_db.get_items_by_report(report_id)
+    
+    import pandas as pd
+    from jinja2 import Template
+    from weasyprint import HTML
+    import io
+
+    # Generate HTML blocks
+    item_blocks = []
+    for idx, item in enumerate(items, 1):
+        snapshot = item.get("data_snapshot", [])
+        if not snapshot:
+            continue
+        df = pd.DataFrame(snapshot)
+        # Clean headers
+        df.columns = [str(col).replace("_", " ").title() for col in df.columns]
+        
+        table_html = df.to_html(classes="report-table", index=False)
+        item_blocks.append({
+            "idx": idx,
+            "query": item.get("query_text", "Data Snapshot"),
+            "explanation": item.get("explanation", ""),
+            "table_html": table_html
+        })
+        
+    template_str = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <title>{{ report.name }}</title>
+        <style>
+            @page {
+                size: A4;
+                margin: 2cm;
+                @bottom-right {
+                    content: "Page " counter(page);
+                }
+            }
+            body {
+                font-family: Arial, sans-serif;
+                color: #333;
+                line-height: 1.6;
+            }
+            h1 { color: #1a365d; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
+            h2 { color: #2d3748; margin-top: 30px; font-size: 1.25rem;}
+            p { margin: 10px 0; }
+            .report-desc { color: #4a5568; margin-bottom: 40px; }
+            table.report-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 20px 0;
+                font-size: 0.9rem;
+            }
+            .report-table th, .report-table td {
+                padding: 12px 15px;
+                border: 1px solid #e2e8f0;
+            }
+            .report-table th {
+                background-color: #f7fafc;
+                text-align: left;
+                font-weight: 600;
+                color: #4a5568;
+            }
+            .report-table tr:nth-child(even) { background-color: #f8fafc; }
+            .item-container { margin-bottom: 50px; page-break-inside: avoid; }
+            .explanation { background-color: #f0fff4; padding: 10px; border-left: 4px solid #48bb78; }
+        </style>
+    </head>
+    <body>
+        <h1>{{ report.name }}</h1>
+        {% if report.description %}
+            <div class="report-desc">{{ report.description }}</div>
+        {% endif %}
+        <div><i>Generated on: {{ date }}</i></div>
+        <hr/>
+        
+        {% for block in blocks %}
+        <div class="item-container">
+            <h2>{{ block.idx }}. {{ block.query }}</h2>
+            {% if block.explanation %}
+                <div class="explanation">{{ block.explanation }}</div>
+            {% endif %}
+            {{ block.table_html | safe }}
+        </div>
+        {% endfor %}
+    </body>
+    </html>
+    """
+    
+    template = Template(template_str)
+    html_out = template.render(
+        report=report, 
+        blocks=item_blocks, 
+        date=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+    )
+    
+    pdf_buffer = io.BytesIO()
+    HTML(string=html_out).write_pdf(pdf_buffer)
+    pdf_buffer.seek(0)
+    
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(
+        pdf_buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=report_{report_id}.pdf"}
     )
 
 

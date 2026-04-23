@@ -6,6 +6,7 @@ import {
   PanelLeftOpen,
   Plus,
   Trash2,
+  BarChart2,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
@@ -134,6 +135,17 @@ export default function Sidebar({ activeChatId, collapsed = false, onToggle }) {
         >
           <Plus className="h-4 w-4" />
           {!collapsed ? "New Chat" : null}
+        </button>
+        <button
+          type="button"
+          onClick={() => navigate("/reports")}
+          className={`mt-3 inline-flex items-center justify-center gap-2 rounded-2xl border border-slate-700 bg-slate-900 px-4 py-3 text-sm font-medium text-slate-100 transition hover:border-emerald-500 hover:bg-slate-800 ${
+            collapsed ? "w-12 px-0" : "w-full"
+          }`}
+          title="Reports Analytics"
+        >
+          <BarChart2 className="h-4 w-4 text-emerald-400" />
+          {!collapsed ? "Reports Dashboard" : null}
         </button>
       </div>
 

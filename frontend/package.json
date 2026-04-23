@@ -14,7 +14,10 @@
     "lucide-react": "^0.511.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
-    "react-router-dom": "^7.6.0"
+    "react-router-dom": "^7.6.0",
+    "@mui/material": "^6.4.0",
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.4.1",

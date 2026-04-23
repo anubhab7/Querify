@@ -7,7 +7,7 @@ import ChatComposer from "../components/ChatComposer";
 import QueryCard from "../components/QueryCard";
 import SuggestionChips from "../components/SuggestionChips";
 import { useToast } from "../hooks/useToast";
-import { getErrorMessage, getFriendlyQueryError } from "../services/api";
+import { getErrorMessage, getFriendlyQueryError, fetchReports, addReportItem } from "../services/api";
 import { getChatHistory, getChatStatus, getSchema } from "../services/chats";
 import { getKpis, getLlmProviders, runQuery } from "../services/query";
 
@@ -65,6 +65,7 @@ export default function ChatPage() {
   const [availableModels, setAvailableModels] = useState(FALLBACK_LLM_OPTIONS);
   const [selectedModel, setSelectedModel] = useState(getStoredPreferredModel);
   const bottomRef = useRef(null);
+  const [reports, setReports] = useState([]);
 
   function normalizeMessage(message, index = 0) {
     return {
@@ -137,6 +138,10 @@ export default function ChatPage() {
     await Promise.allSettled([historyTask, kpiTask, statusTask]);
     setWorkspaceRefreshing(false);
   }
+
+  useEffect(() => {
+    fetchReports().then(setReports).catch(() => {});
+  }, []);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -282,6 +287,21 @@ export default function ChatPage() {
     }
   }
 
+  async function handleAddToReport(reportId, item) {
+    if (!reportId) return;
+    try {
+      await addReportItem(reportId, {
+        query_text: item.user_input,
+        sql_query: item.sql_query,
+        explanation: item.explanation,
+        data_snapshot: item.results,
+      });
+      showToast({ variant: 'success', title: 'Added to report successfully' });
+    } catch (e) {
+      showToast({ variant: 'error', title: 'Failed to add to report' });
+    }
+  }
+
   async function handleQuerySubmit(event) {
     event?.preventDefault();
     await submitQuery(prompt);
@@ -404,7 +424,14 @@ export default function ChatPage() {
 
         <div className="mt-5 grid gap-6">
           {messages.length ? (
-            messages.map((item) => <QueryCard key={item.id || item.created_at} item={item} />)
+            messages.map((item) => (
+              <QueryCard 
+                key={item.id || item.created_at} 
+                item={item} 
+                reports={reports}
+                onAddToReport={(reportId) => handleAddToReport(reportId, item)}
+              />
+            ))
           ) : (
             <div className="rounded-3xl border border-dashed border-slate-200 bg-slate-50 px-5 py-10 text-center text-sm text-slate-500">
               Ask a question or use a KPI suggestion to start the conversation.

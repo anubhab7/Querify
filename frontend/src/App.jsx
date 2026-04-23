@@ -7,6 +7,8 @@ import LandingPage from "./pages/LandingPage";
 import LoginPage from "./pages/LoginPage";
 import NotFoundPage from "./pages/NotFoundPage";
 import RegisterPage from "./pages/RegisterPage";
+import ReportsDashboard from "./pages/ReportsDashboard";
+import ReportDetail from "./pages/ReportDetail";
 
 export default function App() {
   return (
@@ -36,6 +38,8 @@ export default function App() {
       >
         <Route index element={<LandingPage />} />
         <Route path="/chat/:chatId" element={<ChatPage />} />
+        <Route path="/reports" element={<ReportsDashboard />} />
+        <Route path="/reports/:id" element={<ReportDetail />} />
       </Route>
       <Route path="*" element={<NotFoundPage />} />
     </Routes>
