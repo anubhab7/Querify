@@ -292,3 +292,11 @@ class ReportDetailResponse(BaseModel):
     
     report: ReportResponse
     items: List[ReportItemResponse]
+
+
+class ReportFormatRequest(BaseModel):
+    """Request model for formatting a report before PDF generation."""
+    
+    theme: str = Field("default", description="Color theme for the report")
+    font: str = Field("Arial", description="Font family for the report")
+    visualizations: Dict[str, str] = Field(default_factory=dict, description="Mapping of item ID to visualization type (table, bar, line, pie)")

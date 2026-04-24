@@ -75,8 +75,8 @@ export const deleteReportItem = async (itemId) => {
   return response.data;
 };
 
-export const generateReportPdf = async (reportId) => {
-  const response = await api.post(`/reports/${reportId}/generate`, {}, {
+export const generateReportPdf = async (reportId, config) => {
+  const response = await api.post(`/reports/${reportId}/generate`, config || {}, {
     responseType: 'blob'
   });
   return response.data;

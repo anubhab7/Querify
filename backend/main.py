@@ -47,6 +47,7 @@ from models.schema import (
     ReportItemCreateRequest,
     ReportItemResponse,
     ReportDetailResponse,
+    ReportFormatRequest,
 )
 from services.chat_session import ChatSessionManager
 from services.database_service import DatabaseConnectionError, DatabaseService
@@ -1032,6 +1033,7 @@ async def delete_report_item(
 @app.post("/reports/{report_id}/generate", tags=["Reports"])
 async def generate_report_pdf(
     report_id: str,
+    request: ReportFormatRequest,
     current_user: dict = Depends(get_current_user),
 ):
     app_db, _, _ = await require_services()
@@ -1043,88 +1045,151 @@ async def generate_report_pdf(
     
     import pandas as pd
     from jinja2 import Template
+    import os
+    if "DYLD_FALLBACK_LIBRARY_PATH" not in os.environ:
+        os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = "/opt/homebrew/lib"
     from weasyprint import HTML
     import io
+    import base64
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import seaborn as sns
 
-    # Generate HTML blocks
+    theme_colors = {
+        "default": {"h1": "#1a365d", "th": "#f7fafc", "th_text": "#4a5568", "text": "#333"},
+        "dark": {"h1": "#e2e8f0", "th": "#2d3748", "th_text": "#e2e8f0", "text": "#f7fafc", "bg": "#1a202c"},
+        "blue": {"h1": "#2b6cb0", "th": "#ebf8ff", "th_text": "#2b6cb0", "text": "#2d3748"},
+    }
+    theme_cfg = theme_colors.get(request.theme, theme_colors["default"])
+    body_bg = theme_cfg.get("bg", "#ffffff")
+
     item_blocks = []
     for idx, item in enumerate(items, 1):
         snapshot = item.get("data_snapshot", [])
         if not snapshot:
             continue
         df = pd.DataFrame(snapshot)
+        
         # Clean headers
         df.columns = [str(col).replace("_", " ").title() for col in df.columns]
         
-        table_html = df.to_html(classes="report-table", index=False)
+        # Format decimals
+        for col in df.columns:
+            if pd.api.types.is_numeric_dtype(df[col]):
+                df[col] = df[col].apply(lambda x: round(x, 2) if pd.notnull(x) else x)
+
+        viz_type = request.visualizations.get(str(item["id"]), "table")
+        
+        content_html = ""
+        
+        if viz_type == "table":
+            content_html = df.to_html(classes="report-table", index=False)
+        else:
+            plt.figure(figsize=(8, 4))
+            sns.set_theme(style="whitegrid")
+            if request.theme == "dark":
+                plt.style.use('dark_background')
+            
+            try:
+                numeric_cols = df.select_dtypes(include='number').columns.tolist()
+                cat_cols = df.select_dtypes(exclude='number').columns.tolist()
+                
+                if viz_type == "bar" and len(numeric_cols) > 0 and len(cat_cols) > 0:
+                    sns.barplot(data=df.head(10), x=cat_cols[0], y=numeric_cols[0])
+                    plt.xticks(rotation=45)
+                elif viz_type == "line" and len(numeric_cols) > 0:
+                    x_col = cat_cols[0] if len(cat_cols) > 0 else df.index
+                    sns.lineplot(data=df, x=x_col, y=numeric_cols[0])
+                    plt.xticks(rotation=45)
+                elif viz_type == "pie" and len(numeric_cols) > 0 and len(cat_cols) > 0:
+                    data = df.head(10)
+                    plt.pie(data[numeric_cols[0]], labels=data[cat_cols[0]], autopct='%1.1f%%')
+                else:
+                    content_html = df.to_html(classes="report-table", index=False)
+                    
+                if not content_html:
+                    plt.tight_layout()
+                    img_buf = io.BytesIO()
+                    plt.savefig(img_buf, format='png')
+                    img_buf.seek(0)
+                    img_b64 = base64.b64encode(img_buf.read()).decode('utf-8')
+                    content_html = f'<img src="data:image/png;base64,{img_b64}" style="max-width:100%;">'
+            except Exception as e:
+                logger.error(f"Failed to generate chart: {e}")
+                content_html = df.to_html(classes="report-table", index=False)
+            finally:
+                plt.close()
+
         item_blocks.append({
             "idx": idx,
             "query": item.get("query_text", "Data Snapshot"),
             "explanation": item.get("explanation", ""),
-            "table_html": table_html
+            "content_html": content_html
         })
         
-    template_str = """
+    template_str = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="utf-8">
-        <title>{{ report.name }}</title>
+        <title>{{{{ report.name }}}}</title>
         <style>
-            @page {
+            @page {{
                 size: A4;
                 margin: 2cm;
-                @bottom-right {
+                @bottom-right {{
                     content: "Page " counter(page);
-                }
-            }
-            body {
-                font-family: Arial, sans-serif;
-                color: #333;
+                }}
+            }}
+            body {{
+                font-family: {request.font}, Arial, sans-serif;
+                color: {theme_cfg["text"]};
+                background-color: {body_bg};
                 line-height: 1.6;
-            }
-            h1 { color: #1a365d; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }
-            h2 { color: #2d3748; margin-top: 30px; font-size: 1.25rem;}
-            p { margin: 10px 0; }
-            .report-desc { color: #4a5568; margin-bottom: 40px; }
-            table.report-table {
+            }}
+            h1 {{ color: {theme_cfg["h1"]}; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
+            h2 {{ color: {theme_cfg["text"]}; margin-top: 30px; font-size: 1.25rem;}}
+            p {{ margin: 10px 0; }}
+            .report-desc {{ color: {theme_cfg["text"]}; opacity: 0.8; margin-bottom: 40px; }}
+            table.report-table {{
                 width: 100%;
                 border-collapse: collapse;
                 margin: 20px 0;
                 font-size: 0.9rem;
-            }
-            .report-table th, .report-table td {
+            }}
+            .report-table th, .report-table td {{
                 padding: 12px 15px;
                 border: 1px solid #e2e8f0;
-            }
-            .report-table th {
-                background-color: #f7fafc;
+            }}
+            .report-table th {{
+                background-color: {theme_cfg["th"]};
                 text-align: left;
                 font-weight: 600;
-                color: #4a5568;
-            }
-            .report-table tr:nth-child(even) { background-color: #f8fafc; }
-            .item-container { margin-bottom: 50px; page-break-inside: avoid; }
-            .explanation { background-color: #f0fff4; padding: 10px; border-left: 4px solid #48bb78; }
+                color: {theme_cfg["th_text"]};
+            }}
+            .report-table tr:nth-child(even) {{ opacity: 0.95; }}
+            .item-container {{ margin-bottom: 50px; page-break-inside: avoid; }}
+            .explanation {{ background-color: rgba(72, 187, 120, 0.1); padding: 10px; border-left: 4px solid #48bb78; margin-bottom: 15px; }}
         </style>
     </head>
     <body>
-        <h1>{{ report.name }}</h1>
-        {% if report.description %}
-            <div class="report-desc">{{ report.description }}</div>
-        {% endif %}
-        <div><i>Generated on: {{ date }}</i></div>
+        <h1>{{{{ report.name }}}}</h1>
+        {{% if report.description %}}
+            <div class="report-desc">{{{{ report.description }}}}</div>
+        {{% endif %}}
+        <div><i>Generated on: {{{{ date }}}}</i></div>
         <hr/>
         
-        {% for block in blocks %}
+        {{% for block in blocks %}}
         <div class="item-container">
-            <h2>{{ block.idx }}. {{ block.query }}</h2>
-            {% if block.explanation %}
-                <div class="explanation">{{ block.explanation }}</div>
-            {% endif %}
-            {{ block.table_html | safe }}
+            <h2>{{{{ block.idx }}}}. {{{{ block.query }}}}</h2>
+            {{% if block.explanation %}}
+                <div class="explanation">{{{{ block.explanation }}}}</div>
+            {{% endif %}}
+            {{{{ block.content_html | safe }}}}
         </div>
-        {% endfor %}
+        {{% endfor %}}
     </body>
     </html>
     """

@@ -43,27 +43,6 @@ export default function ReportDetail() {
     }
   };
 
-  const handleGeneratePdf = async () => {
-    setGenerating(true);
-    try {
-      const blob = await generateReportPdf(id);
-      const url = window.URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.style.display = 'none';
-      a.href = url;
-      a.download = `report_${id}.pdf`;
-      document.body.appendChild(a);
-      a.click();
-      window.URL.revokeObjectURL(url);
-      document.body.removeChild(a);
-      showToast({ title: 'Report generated successfully', variant: 'success' });
-    } catch (error) {
-      showToast({ title: 'Failed to generate report', variant: 'error' });
-    } finally {
-      setGenerating(false);
-    }
-  };
-
   if (loading) {
     return (
       <div className="flex h-full w-full items-center justify-center">
@@ -116,21 +95,11 @@ export default function ReportDetail() {
               )}
             </div>
             <button
-              onClick={handleGeneratePdf}
-              disabled={generating || items.length === 0}
+              onClick={() => navigate(`/reports/${id}/format`)}
+              disabled={items.length === 0}
               className="inline-flex shrink-0 items-center gap-2 rounded-2xl bg-indigo-600 px-5 py-3 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
             >
-              {generating ? (
-                <>
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                  Generating PDF...
-                </>
-              ) : (
-                <>
-                  <Download className="h-5 w-5" />
-                  Generate PDF Report
-                </>
-              )}
+              Format Report
             </button>
           </div>
         </motion.section>

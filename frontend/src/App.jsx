@@ -9,6 +9,7 @@ import NotFoundPage from "./pages/NotFoundPage";
 import RegisterPage from "./pages/RegisterPage";
 import ReportsDashboard from "./pages/ReportsDashboard";
 import ReportDetail from "./pages/ReportDetail";
+import ReportFormat from "./pages/ReportFormat";
 
 export default function App() {
   return (
@@ -40,6 +41,7 @@ export default function App() {
         <Route path="/chat/:chatId" element={<ChatPage />} />
         <Route path="/reports" element={<ReportsDashboard />} />
         <Route path="/reports/:id" element={<ReportDetail />} />
+        <Route path="/reports/:id/format" element={<ReportFormat />} />
       </Route>
       <Route path="*" element={<NotFoundPage />} />
     </Routes>
