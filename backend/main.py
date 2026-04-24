@@ -1057,12 +1057,27 @@ async def generate_report_pdf(
     import seaborn as sns
 
     theme_colors = {
-        "default": {"h1": "#1a365d", "th": "#f7fafc", "th_text": "#4a5568", "text": "#333"},
-        "dark": {"h1": "#e2e8f0", "th": "#2d3748", "th_text": "#e2e8f0", "text": "#f7fafc", "bg": "#1a202c"},
-        "blue": {"h1": "#2b6cb0", "th": "#ebf8ff", "th_text": "#2b6cb0", "text": "#2d3748"},
+        "default": {"h1": "#1a365d", "th": "#f7fafc", "th_text": "#4a5568", "text": "#333", "border": "#e2e8f0"},
+        "dark": {"h1": "#e2e8f0", "th": "#2d3748", "th_text": "#e2e8f0", "text": "#f7fafc", "bg": "#1a202c", "border": "#4a5568"},
+        "blue": {"h1": "#2b6cb0", "th": "#ebf8ff", "th_text": "#2b6cb0", "text": "#2d3748", "border": "#bee3f8"},
     }
     theme_cfg = theme_colors.get(request.theme, theme_colors["default"])
     body_bg = theme_cfg.get("bg", "#ffffff")
+
+    font_mapping = {
+        "Modern/San-Serif": {
+            "import_url": "https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=Montserrat:wght@400;600&family=Roboto:wght@400;500&family=Open+Sans:wght@400;600&display=swap",
+            "h_font": "'Montserrat', 'IBM Plex Sans', sans-serif",
+            "p_font": "'Open Sans', 'Roboto', sans-serif"
+        },
+        "Serif/Elegant": {
+            "import_url": "https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600&family=Lora:wght@400;500&family=Garamond:wght@400;600&display=swap",
+            "h_font": "'Playfair Display', serif",
+            "p_font": "'Lora', 'Garamond', serif"
+        }
+    }
+    
+    active_font = font_mapping.get(request.font, font_mapping["Modern/San-Serif"])
 
     item_blocks = []
     for idx, item in enumerate(items, 1):
@@ -1088,23 +1103,27 @@ async def generate_report_pdf(
         else:
             plt.figure(figsize=(8, 4))
             sns.set_theme(style="whitegrid")
+            palette = "deep"
             if request.theme == "dark":
                 plt.style.use('dark_background')
+                palette = "pastel"
+            elif request.theme == "blue":
+                palette = "Blues_d"
             
             try:
                 numeric_cols = df.select_dtypes(include='number').columns.tolist()
                 cat_cols = df.select_dtypes(exclude='number').columns.tolist()
                 
                 if viz_type == "bar" and len(numeric_cols) > 0 and len(cat_cols) > 0:
-                    sns.barplot(data=df.head(10), x=cat_cols[0], y=numeric_cols[0])
+                    sns.barplot(data=df.head(10), x=cat_cols[0], y=numeric_cols[0], hue=cat_cols[0], palette=palette, legend=False)
                     plt.xticks(rotation=45)
                 elif viz_type == "line" and len(numeric_cols) > 0:
                     x_col = cat_cols[0] if len(cat_cols) > 0 else df.index
-                    sns.lineplot(data=df, x=x_col, y=numeric_cols[0])
+                    sns.lineplot(data=df, x=x_col, y=numeric_cols[0], color=sns.color_palette(palette)[0])
                     plt.xticks(rotation=45)
                 elif viz_type == "pie" and len(numeric_cols) > 0 and len(cat_cols) > 0:
                     data = df.head(10)
-                    plt.pie(data[numeric_cols[0]], labels=data[cat_cols[0]], autopct='%1.1f%%')
+                    plt.pie(data[numeric_cols[0]], labels=data[cat_cols[0]], autopct='%1.1f%%', colors=sns.color_palette(palette))
                 else:
                     content_html = df.to_html(classes="report-table", index=False)
                     
@@ -1135,42 +1154,57 @@ async def generate_report_pdf(
         <meta charset="utf-8">
         <title>{{{{ report.name }}}}</title>
         <style>
+            @import url('{active_font["import_url"]}');
             @page {{
                 size: A4;
-                margin: 2cm;
+                margin: 2.5cm;
                 @bottom-right {{
                     content: "Page " counter(page);
                 }}
             }}
             body {{
-                font-family: {request.font}, Arial, sans-serif;
+                font-family: {active_font["p_font"]};
                 color: {theme_cfg["text"]};
                 background-color: {body_bg};
                 line-height: 1.6;
             }}
-            h1 {{ color: {theme_cfg["h1"]}; border-bottom: 2px solid #e2e8f0; padding-bottom: 10px; }}
+            h1, h2, h3, h4, h5, h6 {{
+                font-family: {active_font["h_font"]};
+            }}
+            h1 {{ color: {theme_cfg["h1"]}; border-bottom: 2px solid {theme_cfg["border"]}; padding-bottom: 10px; }}
             h2 {{ color: {theme_cfg["text"]}; margin-top: 30px; font-size: 1.25rem;}}
             p {{ margin: 10px 0; }}
             .report-desc {{ color: {theme_cfg["text"]}; opacity: 0.8; margin-bottom: 40px; }}
             table.report-table {{
+                table-layout: fixed;
                 width: 100%;
                 border-collapse: collapse;
                 margin: 20px 0;
                 font-size: 0.9rem;
+                word-wrap: break-word;
+                overflow-wrap: break-word;
             }}
             .report-table th, .report-table td {{
                 padding: 12px 15px;
-                border: 1px solid #e2e8f0;
+                border: 1px solid {theme_cfg["border"]};
+                word-wrap: break-word;
+                overflow-wrap: break-word;
             }}
             .report-table th {{
                 background-color: {theme_cfg["th"]};
                 text-align: left;
                 font-weight: 600;
                 color: {theme_cfg["th_text"]};
+                border-bottom: 2px solid {theme_cfg["border"]};
             }}
             .report-table tr:nth-child(even) {{ opacity: 0.95; }}
             .item-container {{ margin-bottom: 50px; page-break-inside: avoid; }}
-            .explanation {{ background-color: rgba(72, 187, 120, 0.1); padding: 10px; border-left: 4px solid #48bb78; margin-bottom: 15px; }}
+            .explanation {{ 
+                background-color: rgba(99, 102, 241, 0.05); 
+                padding: 15px; 
+                border-left: 4px solid #6366f1; 
+                margin-bottom: 40px; 
+            }}
         </style>
     </head>
     <body>
@@ -1206,10 +1240,11 @@ async def generate_report_pdf(
     pdf_buffer.seek(0)
     
     from fastapi.responses import StreamingResponse
+    report_filename = report.get('name', 'report').replace(' ', '_')
     return StreamingResponse(
         pdf_buffer,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"attachment; filename=report_{report_id}.pdf"}
+        headers={"Content-Disposition": f"attachment; filename={report_filename}.pdf"}
     )
 
 

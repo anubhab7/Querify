@@ -22,6 +22,9 @@ export default function ReportsDashboard() {
     try {
       const data = await fetchReports();
       setReports(data);
+      const titleMap = Object.fromEntries(data.map((report) => [report.id, report.name]));
+      localStorage.setItem("querify_report_titles", JSON.stringify(titleMap));
+      window.dispatchEvent(new Event("querify:report-titles"));
     } catch (error) {
       console.error('Failed to fetch reports', error);
       showToast({ title: 'Failed to fetch reports', variant: 'error' });

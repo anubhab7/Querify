@@ -22,12 +22,17 @@ export default function Breadcrumbs({ pathname }) {
     }
 
     window.addEventListener("querify:chat-titles", refreshTitles);
-    return () => window.removeEventListener("querify:chat-titles", refreshTitles);
+    window.addEventListener("querify:report-titles", refreshTitles);
+    return () => {
+      window.removeEventListener("querify:chat-titles", refreshTitles);
+      window.removeEventListener("querify:report-titles", refreshTitles);
+    };
   }, []);
 
   const segments = useMemo(() => {
     const rawSegments = pathname.split("/").filter(Boolean);
     const savedTitles = JSON.parse(localStorage.getItem("querify_chat_titles") || "{}");
+    const savedReportTitles = JSON.parse(localStorage.getItem("querify_report_titles") || "{}");
 
     if (rawSegments.length === 0) {
       return [{ label: "Home", to: "/" }];
@@ -37,16 +42,21 @@ export default function Breadcrumbs({ pathname }) {
     let current = "";
     rawSegments.forEach((segment) => {
       current += `/${segment}`;
+      
+      let label = formatSegment(segment);
+      if (segment === params.chatId) {
+        label = savedTitles[segment] || params.chatId;
+      } else if (segment === params.id) {
+        label = savedReportTitles[segment] || params.id;
+      }
+
       crumbs.push({
-        label:
-          segment === params.chatId
-            ? savedTitles[segment] || params.chatId
-            : formatSegment(segment),
+        label,
         to: current,
       });
     });
     return crumbs;
-  }, [params.chatId, pathname, titleVersion]);
+  }, [params.chatId, params.id, pathname, titleVersion]);
 
   return (
     <nav className="flex flex-wrap items-center gap-2 text-sm text-slate-500">

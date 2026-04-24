@@ -16,7 +16,7 @@ export default function ReportFormat() {
   const [items, setItems] = useState([]);
 
   const [theme, setTheme] = useState('default');
-  const [font, setFont] = useState('Arial');
+  const [font, setFont] = useState('Modern/San-Serif');
   const [visualizations, setVisualizations] = useState({});
 
   useEffect(() => {
@@ -29,6 +29,11 @@ export default function ReportFormat() {
       const data = await fetchReportDetails(id);
       setReport(data.report);
       setItems(data.items);
+
+      const stored = JSON.parse(localStorage.getItem("querify_report_titles") || "{}");
+      stored[id] = data.report.name;
+      localStorage.setItem("querify_report_titles", JSON.stringify(stored));
+      window.dispatchEvent(new Event("querify:report-titles"));
 
       const initialViz = {};
       data.items.forEach(item => {
@@ -63,7 +68,7 @@ export default function ReportFormat() {
       const a = document.createElement('a');
       a.style.display = 'none';
       a.href = url;
-      a.download = `report_${id}.pdf`;
+      a.download = `${report.name.replace(/\s+/g, '_')}.pdf`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
@@ -172,9 +177,8 @@ export default function ReportFormat() {
               onChange={(e) => setFont(e.target.value)}
               className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-sm focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
             >
-              <option value="Arial">Arial (Sans-serif)</option>
-              <option value="Times New Roman">Times New Roman (Serif)</option>
-              <option value="Courier New">Courier New (Monospace)</option>
+              <option value="Modern/San-Serif">Modern / Sans-Serif</option>
+              <option value="Serif/Elegant">Serif / Elegant</option>
             </select>
           </div>
         </div>

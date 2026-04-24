@@ -1,13 +1,22 @@
-import { motion } from "framer-motion";
+import { motion, AnimatePresence } from "framer-motion";
 import { Bot, Code2, LoaderCircle, UserRound, BookmarkPlus } from "lucide-react";
-import { useState } from "react";
-import { Menu, MenuItem, IconButton, Tooltip } from "@mui/material";
-
+import { useState, useRef, useEffect } from "react";
 import ResultsTable from "./ResultsTable";
 
 export default function QueryCard({ item, reports = [], onAddToReport }) {
-  const [anchorEl, setAnchorEl] = useState(null);
-  
+  const [dropdownOpen, setDropdownOpen] = useState(false);
+  const dropdownRef = useRef(null);
+
+  useEffect(() => {
+    function handleClickOutside(event) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
   const results = Array.isArray(item?.results)
     ? item.results.filter((row) => row && typeof row === "object" && !Array.isArray(row))
     : [];
@@ -78,27 +87,52 @@ export default function QueryCard({ item, reports = [], onAddToReport }) {
                       <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">
                         Results
                       </p>
-                      <div>
-                        <Tooltip title="Add to Report">
-                          <IconButton size="small" onClick={(e) => setAnchorEl(e.currentTarget)}>
-                            <BookmarkPlus className="h-4 w-4 text-indigo-500" />
-                          </IconButton>
-                        </Tooltip>
-                        <Menu 
-                          anchorEl={anchorEl} 
-                          open={Boolean(anchorEl)} 
-                          onClose={() => setAnchorEl(null)}
+                      <div className="relative" ref={dropdownRef}>
+                        <button
+                          onClick={() => setDropdownOpen(!dropdownOpen)}
+                          title="Add to Report"
+                          className="flex items-center justify-center rounded-full p-2 text-indigo-500 transition-colors hover:bg-indigo-50 hover:text-indigo-700 focus:outline-none"
                         >
-                          {reports.length === 0 ? (
-                              <MenuItem disabled>No reports available</MenuItem>
-                          ) : (
-                            reports.map(r => (
-                              <MenuItem key={r.id} onClick={() => { setAnchorEl(null); onAddToReport(r.id); }}>
-                                {r.name}
-                              </MenuItem>
-                            ))
+                          <BookmarkPlus className="h-5 w-5" />
+                        </button>
+                        
+                        <AnimatePresence>
+                          {dropdownOpen && (
+                            <motion.div
+                              initial={{ opacity: 0, y: 8, scale: 0.95 }}
+                              animate={{ opacity: 1, y: 0, scale: 1 }}
+                              exit={{ opacity: 0, y: 8, scale: 0.95 }}
+                              transition={{ duration: 0.15, ease: "easeOut" }}
+                              className="absolute right-0 top-full mt-2 w-64 origin-top-right overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl focus:outline-none z-50"
+                            >
+                              <div className="py-2">
+                                <div className="px-4 py-2 border-b border-slate-100 mb-1">
+                                  <p className="text-xs font-bold uppercase tracking-wider text-slate-500">Save to Report</p>
+                                </div>
+                                {reports.length === 0 ? (
+                                  <div className="px-4 py-3 text-sm text-slate-500 italic">
+                                    No reports available
+                                  </div>
+                                ) : (
+                                  <div className="max-h-60 overflow-y-auto custom-scrollbar">
+                                    {reports.map((r) => (
+                                      <button
+                                        key={r.id}
+                                        onClick={() => {
+                                          setDropdownOpen(false);
+                                          onAddToReport(r.id);
+                                        }}
+                                        className="block w-full px-4 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-indigo-50 hover:text-indigo-700 transition-colors"
+                                      >
+                                        <span className="truncate block">{r.name}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </motion.div>
                           )}
-                        </Menu>
+                        </AnimatePresence>
                       </div>
                     </div>
                     <ResultsTable rows={results} />

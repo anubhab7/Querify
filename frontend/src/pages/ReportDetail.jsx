@@ -24,6 +24,11 @@ export default function ReportDetail() {
       const data = await fetchReportDetails(id);
       setReport(data.report);
       setItems(data.items);
+      
+      const stored = JSON.parse(localStorage.getItem("querify_report_titles") || "{}");
+      stored[id] = data.report.name;
+      localStorage.setItem("querify_report_titles", JSON.stringify(stored));
+      window.dispatchEvent(new Event("querify:report-titles"));
     } catch (error) {
       console.error('Failed to fetch report details', error);
       showToast({ title: 'Failed to load report details', variant: 'error' });
